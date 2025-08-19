@@ -191,11 +191,11 @@ export class OfferCommand extends BaseCommand {
       )
       .addFields([
         {
-          name: 'Price',
-          value: `${usPrice ? `${usFmtr.format(usPrice.price.discountPrice / 100)}` : ''
-            } / ${eurPrice
-              ? `${eurFmtr.format(eurPrice.price.discountPrice / 100)}`
-              : ''
+          name: `Price${data.offerType === 'BASE_GAME' && usPrice?.price.discountPrice === 19999
+            ? ' (Placeholder)'
+            : ''
+            }`,
+          value: `${usPrice ? `${usFmtr.format(usPrice.price.discountPrice / 100)}` : ''} / ${eurPrice ? `${eurFmtr.format(eurPrice.price.discountPrice / 100)}` : ''
             }`,
           inline: true,
         },
