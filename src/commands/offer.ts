@@ -19,6 +19,11 @@ const mobileNames: Record<string, string> = {
   '39071': 'Android',
 };
 
+const discordEmojis = {
+  "39070": "<:ios:1373245956060872824>",
+  "39071": "<:android:1373245268912373891>",
+} as Record<string, string>;
+
 export class OfferCommand extends BaseCommand {
   override data = new SlashCommandBuilder()
     .setName('offer')
@@ -121,6 +126,8 @@ export class OfferCommand extends BaseCommand {
     const eurPrice = priceEUR.status === 'fulfilled' ? priceEUR.value : null;
     const tops = rawTops.status === 'fulfilled' ? rawTops.value : null;
 
+    const hasMobile = data.tags.some((tag) => mobilePlatforms.includes(tag.id));
+
     const eurFmtr = new Intl.NumberFormat('es-ES', {
       style: 'currency',
       currency: 'EUR',
@@ -175,8 +182,18 @@ export class OfferCommand extends BaseCommand {
       return 'Check more offers on egdata.app';
     };
 
+    const platformEmojis = [] as string[];
+
+    if (hasMobile) {
+      data.tags.forEach((tag) => {
+        if (discordEmojis[tag.id]) {
+          platformEmojis.push(discordEmojis[tag.id] as string);
+        }
+      })
+    }
+
     const embed = new EmbedBuilder()
-      .setTitle(`${data.title}${data.prePurchase ? ' (Pre-Purchase)' : ''}`)
+      .setTitle(`${data.title}${data.prePurchase ? ' (Pre-Purchase)' : ''}${platformEmojis.join(' ')}`)
       .setDescription(data.description)
       .setURL(
         `https://egdata.app/offers/${data.id}?utm_source=discord&utm_medium=bot&utm_campaign=offer`
