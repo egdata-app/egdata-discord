@@ -58,11 +58,14 @@ export class FreebiesCommand extends BaseCommand {
         continue;
       }
 
-      const hasPrice = freebie.price?.price;
+      const hasValidPrice = freebie.price?.price && 
+        typeof freebie.price.price.originalPrice === 'number' && 
+        !isNaN(freebie.price.price.originalPrice) &&
+        freebie.price.price.originalPrice > 0;
 
       const priceFmtr = new Intl.NumberFormat('en-US', {
         style: 'currency',
-        currency: freebie.price?.price.currencyCode || 'USD',
+        currency: freebie.price?.price?.currencyCode || 'USD',
       });
 
       const repeatedText =
@@ -70,11 +73,19 @@ export class FreebiesCommand extends BaseCommand {
           ? `(Repeated ${(freebie.giveaway.historical?.length ?? 1) - 1} times)`
           : '';
 
+      // Validate dates to prevent invalid timestamps
+      const startDate = new Date(freebie.giveaway.startDate);
+      const endDate = new Date(freebie.giveaway.endDate);
+      const targetDate = isOnGoing ? endDate : startDate;
+      
+      const isValidDate = !isNaN(targetDate.getTime());
+      const timestamp = isValidDate ? Math.floor(targetDate.getTime() / 1000) : Math.floor(Date.now() / 1000);
+
       embed.addFields([
         {
-          name: `${freebie.title}${hasPrice
+          name: `${freebie.title}${hasValidPrice
               ? ` (${priceFmtr.format(
-                (freebie.price?.price.originalPrice as number) / 100
+                freebie.price!.price.originalPrice / 100
               )})`
               : ''
             }`,
@@ -90,11 +101,7 @@ export class FreebiesCommand extends BaseCommand {
         },
         {
           name: isOnGoing ? 'Ends' : 'Starts',
-          value: `<t:${Math.floor(
-            new Date(
-              isOnGoing ? freebie.giveaway.endDate : freebie.giveaway.startDate
-            ).getTime() / 1000
-          )}:R>`,
+          value: `<t:${timestamp}:R>`,
           inline: true,
         },
       ]);

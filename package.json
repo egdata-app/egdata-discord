@@ -10,7 +10,7 @@
     "dev": "concurrently \"pnpm run watch\" \"pnpm run start\"",
     "watch": "tsc -w",
     "build": "tsc",
-    "start": "node dist/deploy.js && node --watch dist/index.js"
+    "start": "node dist/deploy.js && node --enable-source-maps --watch dist/index.js"
   },
   "keywords": [],
   "author": "",

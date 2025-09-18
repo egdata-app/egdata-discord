@@ -5,6 +5,7 @@
     "rootDir": "src",
     // Use typescript as the compiler
     "incremental": true,
+    "sourceMap": true,
     "typeRoots": ["./node_modules/@types", "./src/types"]
   },
   "include": ["src/**/*"]
