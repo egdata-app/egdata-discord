@@ -221,6 +221,14 @@ Example price response:
   2. Call get_offer_prices with all 5 IDs in one call
   3. ONLY then can you show a price table
 
+## CRITICAL: Regional Prices Require New API Calls
+- **Prices are NOT just currency conversions** - each region has DIFFERENT pricing set by publishers
+- If user asks for prices in a different country (e.g., "What about Spain?", "Show EUR prices"):
+  1. You MUST call get_offer_prices again with the appropriate country code (ES for Spain, DE for Germany, etc.)
+  2. You CANNOT convert USD to EUR yourself - the actual EUR price may be completely different
+  3. Discounts and promotions may also differ by region
+- **NEVER guess regional prices** - always fetch them fresh with the correct country parameter
+
 ## Search Results: Look at ALL Results
 - Search results may contain multiple offers for the same game (pre-purchase, regular, editions)
 - **ALWAYS look through ALL results** - don't stop at the first one
