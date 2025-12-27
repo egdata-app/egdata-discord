@@ -107,10 +107,12 @@ Example: "What's the price history for Cyberpunk?"
 → Step 2: get_offer_price_history(offerId: "the-id-from-search")
 
 Example: "What's the download size for Fortnite?"
-→ Step 1: search_offers(query: "Fortnite") → get the offer ID
-→ Step 2: get_offer_items(offerId: "...") → get item IDs (executables)
+→ Step 1: search_offers(query: "Fortnite") → get the offer ID (use BASE_GAME, not OTHERS/EDITION)
+→ Step 2: get_offer_items(offerId: "...") → get item IDs (look for EXECUTABLE entitlementType)
 → Step 3: get_item_assets(itemId: "...") → get downloadSizeBytes and installedSizeBytes per platform
 → Convert bytes to GB: divide by 1,073,741,824 (or 1024³)
+
+IMPORTANT: For download sizes, always use the BASE_GAME offer (not EDITION or OTHERS). OTHERS offers are giveaway/vault items with no real asset data.
 
 ## Your tools
 - search_offers: Find games by name (returns offer IDs)

@@ -9,32 +9,35 @@ type ToolOptions = { abortSignal?: AbortSignal };
 // Max size for tool results to avoid token limits
 const MAX_RESULT_LENGTH = 15000;
 
-// Filter out pre-purchase offers from arrays
-function filterPrePurchase(arr: unknown[]): unknown[] {
+// Filter out pre-purchase offers and OTHERS/giveaway offers from arrays
+function filterUnwantedOffers(arr: unknown[]): unknown[] {
 	return arr.filter((item) => {
 		if (typeof item === "object" && item !== null) {
 			const record = item as Record<string, unknown>;
-			// Keep items where prePurchase is null, undefined, or false
-			return record.prePurchase !== true;
+			// Filter out pre-purchase offers
+			if (record.prePurchase === true) return false;
+			// Filter out OTHERS offers (mystery giveaways, vault items, etc.)
+			// These have dummy items with no asset data
+			if (record.offerType === "OTHERS") return false;
 		}
 		return true;
 	});
 }
 
-// Truncate large objects to reduce token usage and filter pre-purchase offers
+// Truncate large objects to reduce token usage and filter unwanted offers
 function truncateResult(obj: unknown): unknown {
-	// First, filter pre-purchase offers from any arrays
+	// First, filter unwanted offers (pre-purchase, OTHERS) from any arrays
 	let filtered = obj;
 	if (Array.isArray(obj)) {
-		filtered = filterPrePurchase(obj);
+		filtered = filterUnwantedOffers(obj);
 	} else if (typeof obj === "object" && obj !== null) {
 		const record = obj as Record<string, unknown>;
 		if (Array.isArray(record.elements)) {
-			filtered = { ...record, elements: filterPrePurchase(record.elements) };
+			filtered = { ...record, elements: filterUnwantedOffers(record.elements) };
 		} else if (Array.isArray(record.hits)) {
-			filtered = { ...record, hits: filterPrePurchase(record.hits) };
+			filtered = { ...record, hits: filterUnwantedOffers(record.hits) };
 		} else if (Array.isArray(record.offers)) {
-			filtered = { ...record, offers: filterPrePurchase(record.offers) };
+			filtered = { ...record, offers: filterUnwantedOffers(record.offers) };
 		}
 	}
 
