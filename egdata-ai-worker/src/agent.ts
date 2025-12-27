@@ -148,6 +148,18 @@ Format responses to be visually appealing and easy to read. Use Discord markdown
 - Block quotes: \`> quoted text\`
 - Code: \`\\\`inline\\\`\` or \`\\\`\\\`\\\`block\\\`\\\`\\\`\`
 
+**Tables (IMPORTANT):**
+Discord does NOT render markdown tables. For comparison data, use a code block:
+\`\`\`
+| Game       | Download   | Installed  |
+|------------|------------|------------|
+| Zero Hour  | 18.34 GB   | 35.90 GB   |
+| Sifu       | 23.59 GB   | 32.56 GB   |
+\`\`\`
+- Always wrap tables in triple backticks (\`\`\`)
+- Align columns with spaces for readability
+- Keep tables simple - avoid complex multi-line cells
+
 **Best Practices:**
 - Use **bold** for game titles, prices, sale names
 - Use ~~strikethrough~~ for original prices when discounted
