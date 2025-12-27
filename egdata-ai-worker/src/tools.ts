@@ -9,6 +9,74 @@ type ToolOptions = { abortSignal?: AbortSignal };
 // Max size for tool results to avoid token limits
 const MAX_RESULT_LENGTH = 15000;
 
+// Format bytes to human-readable size (GB, MB, etc.)
+function formatBytes(bytes: number): string {
+	if (bytes === 0) return "0 B";
+	const units = ["B", "KB", "MB", "GB", "TB"];
+	const k = 1024;
+	const i = Math.floor(Math.log(bytes) / Math.log(k));
+	const size = bytes / Math.pow(k, i);
+	return `${size.toFixed(2)} ${units[i]}`;
+}
+
+// Format cents to currency string
+function formatPrice(cents: number, currencyCode = "USD"): string {
+	const amount = cents / 100;
+	try {
+		return new Intl.NumberFormat("en-US", {
+			style: "currency",
+			currency: currencyCode,
+		}).format(amount);
+	} catch {
+		// Fallback for unknown currency codes
+		return `${currencyCode} ${amount.toFixed(2)}`;
+	}
+}
+
+// Add formatted prices to price objects from the API
+// Looks for common price fields (in cents) and adds formatted versions
+function addFormattedPrices(obj: unknown, currencyCode = "USD"): unknown {
+	if (typeof obj !== "object" || obj === null) return obj;
+
+	if (Array.isArray(obj)) {
+		return obj.map((item) => addFormattedPrices(item, currencyCode));
+	}
+
+	const record = obj as Record<string, unknown>;
+	const result: Record<string, unknown> = {};
+
+	// Extract currency code if present in the object
+	const currency = (record.currencyCode as string) || currencyCode;
+
+	// Price fields that are in cents and need formatting
+	const priceFields = [
+		"originalPrice",
+		"discountPrice",
+		"basePayoutPrice",
+		"basePayoutCurrencyCode",
+		"totalPrice",
+		"discountAmount",
+		"voucherDiscount",
+		"total", // often used in stats
+		"totalOriginalPrice", // in price history
+	];
+
+	for (const [key, value] of Object.entries(record)) {
+		if (priceFields.includes(key) && typeof value === "number") {
+			// Add formatted version alongside the original
+			result[key] = value;
+			result[`${key}Formatted`] = formatPrice(value, currency);
+		} else if (typeof value === "object" && value !== null) {
+			// Recursively process nested objects
+			result[key] = addFormattedPrices(value, currency);
+		} else {
+			result[key] = value;
+		}
+	}
+
+	return result;
+}
+
 // Filter out pre-purchase offers and giveaway placeholder offers from arrays
 function filterUnwantedOffers(arr: unknown[]): unknown[] {
 	return arr.filter((item) => {
@@ -297,7 +365,7 @@ export const egdataTools = {
 
 	get_offer_price: tool({
 		description:
-			"Get current pricing information for a specific offer in a given region.",
+			"Get current pricing information for a specific offer in a given region. Returns pre-formatted prices (originalPriceFormatted, discountPriceFormatted) - use these directly.",
 		inputSchema: z.object({
 			offerId: z.string().describe("The offer ID to get price for"),
 			country: z
@@ -305,13 +373,15 @@ export const egdataTools = {
 				.optional()
 				.describe("Country code for regional pricing (default: US)"),
 		}),
-		execute: async ({ offerId, country }, _options: ToolOptions) =>
-			apiRequest(`/offers/${offerId}/price`, { country: country || "US" }),
+		execute: async ({ offerId, country }, _options: ToolOptions) => {
+			const data = await apiRequest(`/offers/${offerId}/price`, { country: country || "US" });
+			return addFormattedPrices(data);
+		},
 	}),
 
 	get_offer_price_history: tool({
 		description:
-			"Get historical pricing data for a game to see past discounts and price changes.",
+			"Get historical pricing data for a game to see past discounts and price changes. Returns pre-formatted prices.",
 		inputSchema: z.object({
 			offerId: z.string().describe("The offer ID to get price history for"),
 			country: z
@@ -319,10 +389,12 @@ export const egdataTools = {
 				.optional()
 				.describe("Country code for regional pricing (default: US)"),
 		}),
-		execute: async ({ offerId, country }, _options: ToolOptions) =>
-			apiRequest(`/offers/${offerId}/price-history`, {
+		execute: async ({ offerId, country }, _options: ToolOptions) => {
+			const data = await apiRequest(`/offers/${offerId}/price-history`, {
 				country: country || "US",
-			}),
+			});
+			return addFormattedPrices(data);
+		},
 	}),
 
 	get_free_games: tool({
@@ -356,12 +428,14 @@ export const egdataTools = {
 
 	get_free_games_stats: tool({
 		description:
-			"Get ALL-TIME aggregated statistics about Epic Games Store giveaways (since 2018, not filtered by year). Returns total count, total value, and number of unique offers. For year-specific data, use get_free_games_history instead.",
+			"Get ALL-TIME aggregated statistics about Epic Games Store giveaways (since 2018, not filtered by year). Returns total count, total value (pre-formatted), and number of unique offers. For year-specific data, use get_free_games_history instead.",
 		inputSchema: z.object({
 			country: z.string().optional().describe("Country code (default: US)"),
 		}),
-		execute: async ({ country }, _options: ToolOptions) =>
-			apiRequest("/free-games/stats", { country: country || "US" }),
+		execute: async ({ country }, _options: ToolOptions) => {
+			const data = await apiRequest("/free-games/stats", { country: country || "US" });
+			return addFormattedPrices(data);
+		},
 	}),
 
 	get_top_sellers: tool({
@@ -506,11 +580,25 @@ export const egdataTools = {
 
 	get_item_assets: tool({
 		description:
-			"Get asset/build information for an item, including download size and installed size per platform. This is the ONLY way to get game download sizes. Returns downloadSizeBytes and installedSizeBytes for each platform (Windows, Mac, etc.).",
+			"Get asset/build information for an item, including download size and installed size per platform. This is the ONLY way to get game download sizes. Returns pre-formatted sizes (downloadSize, installedSize) - use these directly, no math needed.",
 		inputSchema: z.object({
 			itemId: z.string().describe("The item ID to get assets for"),
 		}),
-		execute: async ({ itemId }, _options: ToolOptions) =>
-			apiRequest(`/items/${itemId}/assets`),
+		execute: async ({ itemId }, _options: ToolOptions) => {
+			const data = await apiRequest(`/items/${itemId}/assets`);
+			// Add formatted sizes to each asset
+			if (Array.isArray(data)) {
+				return data.map((asset) => {
+					const a = asset as Record<string, unknown>;
+					return {
+						...a,
+						// Add human-readable sizes
+						downloadSize: typeof a.downloadSizeBytes === "number" ? formatBytes(a.downloadSizeBytes) : null,
+						installedSize: typeof a.installedSizeBytes === "number" ? formatBytes(a.installedSizeBytes) : null,
+					};
+				});
+			}
+			return data;
+		},
 	}),
 };
