@@ -509,7 +509,7 @@ export class EGDataAgent extends DurableObject<Env> {
 						fullText += chunk;
 					}
 
-				// Check for confirmation in tool results
+				// Extract entities and check for confirmations from tool results
 					let pendingConfirmation: { message: string; data: { country?: string; language?: string; fact?: string } } | undefined;
 					try {
 						const steps = await result.steps;
@@ -519,9 +519,9 @@ export class EGDataAgent extends DurableObject<Env> {
 
 							if (stepToolResults) {
 								for (const tr of stepToolResults) {
-									// Tool result structure: { toolName, output: { type, message, data } }
 									const typedResult = tr as {
 										toolName?: string;
+										result?: unknown;
 										output?: {
 											type?: string;
 											message?: string;
@@ -529,6 +529,12 @@ export class EGDataAgent extends DurableObject<Env> {
 										};
 									};
 
+									// Extract entities from tool results (for follow-up context)
+									if (typedResult.toolName && typedResult.result) {
+										agent.extractAndSaveEntities(typedResult.toolName, typedResult.result);
+									}
+
+									// Check for confirmation requests
 									if (
 										typedResult.toolName === "propose_save_context" &&
 										typedResult.output &&

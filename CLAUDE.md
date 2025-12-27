@@ -124,6 +124,11 @@ AI-powered assistant built with [Vercel AI SDK](https://sdk.vercel.ai/) and [Mis
 - WebSocket streaming for real-time responses
 - Tool calling with automatic execution (up to 10 roundtrips)
 - Conversation history maintained across messages
+- Auto-generated thread titles via `<thread-title>` tags (parsed by Discord bot)
+- Discord markdown formatting (bold, italic, strikethrough, headers, lists, etc.)
+
+**Response Format:**
+The AI appends a `<thread-title>Short Title</thread-title>` tag at the end of each response. The Discord bot (`extractThreadTitle` in `src/commands/ask.ts`) strips this tag before displaying and uses it for thread names when users click "Continue in Thread".
 
 ## Adding a New Command
 
