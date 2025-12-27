@@ -107,12 +107,17 @@ Example: "What's the price history for Cyberpunk?"
 → Step 2: get_offer_price_history(offerId: "the-id-from-search")
 
 Example: "What's the download size for Fortnite?"
-→ Step 1: search_offers(query: "Fortnite") → get the offer ID (use BASE_GAME, not OTHERS/EDITION)
-→ Step 2: get_offer_items(offerId: "...") → get item IDs (look for EXECUTABLE entitlementType)
-→ Step 3: get_item_assets(itemId: "...") → get downloadSizeBytes and installedSizeBytes per platform
+→ Step 1: search_offers(query: "Fortnite") → get the offer ID
+→ Step 2: get_offer_items(offerId: "...") → get item IDs
+→ Step 3: Find the EXECUTABLE item with the right platform (Windows) in releaseInfo
+→ Step 4: get_item_assets(itemId: "...") → get downloadSizeBytes and installedSizeBytes
 → Convert bytes to GB: divide by 1,073,741,824 (or 1024³)
 
-IMPORTANT: For download sizes, always use the BASE_GAME offer (not EDITION or OTHERS). OTHERS offers are giveaway/vault items with no real asset data.
+IMPORTANT for download sizes:
+- Look for items with \`entitlementType: "EXECUTABLE"\` and \`releaseInfo.platform\` including "Windows"
+- If the first offer has no Windows executable, try other offers from search results
+- Some games (like Fortnite) have Windows in an OTHERS offer, not the BASE_GAME
+- If get_item_assets returns empty [], try items from other offers
 
 ## Your tools
 - search_offers: Find games by name (returns offer IDs)
@@ -257,24 +262,43 @@ export class EGDataAgent extends DurableObject<Env> {
 			facts: [],
 		};
 
-		// Initialize SQL tables
+		// Initialize SQL tables with session isolation
+		// Messages are isolated per session (conversation-level context)
 		this.sql.exec(`
 			CREATE TABLE IF NOT EXISTS messages (
 				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				session_id TEXT NOT NULL,
 				role TEXT NOT NULL,
 				content TEXT NOT NULL,
 				timestamp INTEGER NOT NULL
 			)
 		`);
 
+		// Add session_id column if it doesn't exist (migration for existing data)
+		try {
+			this.sql.exec(`ALTER TABLE messages ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`);
+		} catch {
+			// Column already exists
+		}
+
+		// Known entities are isolated per session (conversation-level context)
 		this.sql.exec(`
 			CREATE TABLE IF NOT EXISTS known_entities (
-				id TEXT PRIMARY KEY,
+				id TEXT NOT NULL,
+				session_id TEXT NOT NULL,
 				type TEXT NOT NULL,
 				title TEXT NOT NULL,
-				last_used INTEGER NOT NULL
+				last_used INTEGER NOT NULL,
+				PRIMARY KEY (id, session_id)
 			)
 		`);
+
+		// Migration: add session_id to known_entities if needed
+		try {
+			this.sql.exec(`ALTER TABLE known_entities ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`);
+		} catch {
+			// Column already exists
+		}
 
 		this.sql.exec(`
 			CREATE TABLE IF NOT EXISTS user_state (
@@ -337,9 +361,11 @@ export class EGDataAgent extends DurableObject<Env> {
 			return this.handleReject();
 		}
 
-		// Clear conversation
+		// Clear conversation (session-level only)
 		if (url.pathname === "/api/clear" && request.method === "POST") {
-			return this.handleClear();
+			const body = (await request.json()) as { sessionId?: string };
+			const sessionId = body.sessionId || "default";
+			return this.handleClear(sessionId);
 		}
 
 		// Chat endpoint (streaming)
@@ -355,14 +381,15 @@ export class EGDataAgent extends DurableObject<Env> {
 		return Response.json({ error: "Not found" }, { status: 404 });
 	}
 
-	// Get recent conversation history from SQL
-	private getConversationHistory(limit = 10): ChatMessage[] {
+	// Get recent conversation history from SQL (isolated per session)
+	private getConversationHistory(sessionId: string, limit = 10): ChatMessage[] {
 		const rows = this.sql.exec(`
 			SELECT role, content, timestamp
 			FROM messages
+			WHERE session_id = ?
 			ORDER BY timestamp DESC
 			LIMIT ?
-		`, limit).toArray();
+		`, sessionId, limit).toArray();
 		return rows.reverse().map(row => ({
 			role: row.role as "user" | "assistant",
 			content: row.content as string,
@@ -370,31 +397,32 @@ export class EGDataAgent extends DurableObject<Env> {
 		}));
 	}
 
-	// Add message to conversation history
-	private addMessage(role: "user" | "assistant", content: string) {
+	// Add message to conversation history (isolated per session)
+	private addMessage(sessionId: string, role: "user" | "assistant", content: string) {
 		const timestamp = Date.now();
 		this.sql.exec(`
-			INSERT INTO messages (role, content, timestamp)
-			VALUES (?, ?, ?)
-		`, role, content, timestamp);
+			INSERT INTO messages (session_id, role, content, timestamp)
+			VALUES (?, ?, ?, ?)
+		`, sessionId, role, content, timestamp);
 
-		// Keep only last 50 messages
+		// Keep only last 50 messages per session
 		this.sql.exec(`
 			DELETE FROM messages
-			WHERE id NOT IN (
-				SELECT id FROM messages ORDER BY timestamp DESC LIMIT 50
+			WHERE session_id = ? AND id NOT IN (
+				SELECT id FROM messages WHERE session_id = ? ORDER BY timestamp DESC LIMIT 50
 			)
-		`);
+		`, sessionId, sessionId);
 	}
 
-	// Get known entities for context
-	private getKnownEntities(): Array<{ id: string; type: string; title: string }> {
+	// Get known entities for context (isolated per session)
+	private getKnownEntities(sessionId: string): Array<{ id: string; type: string; title: string }> {
 		const rows = this.sql.exec(`
 			SELECT id, type, title
 			FROM known_entities
+			WHERE session_id = ?
 			ORDER BY last_used DESC
 			LIMIT 5
-		`).toArray();
+		`, sessionId).toArray();
 		return rows.map(row => ({
 			id: row.id as string,
 			type: row.type as string,
@@ -402,26 +430,26 @@ export class EGDataAgent extends DurableObject<Env> {
 		}));
 	}
 
-	// Save known entity
-	private saveEntity(id: string, type: string, title: string) {
+	// Save known entity (isolated per session)
+	private saveEntity(sessionId: string, id: string, type: string, title: string) {
 		const now = Date.now();
 		this.sql.exec(`
-			INSERT OR REPLACE INTO known_entities (id, type, title, last_used)
-			VALUES (?, ?, ?, ?)
-		`, id, type, title, now);
+			INSERT OR REPLACE INTO known_entities (id, session_id, type, title, last_used)
+			VALUES (?, ?, ?, ?, ?)
+		`, id, sessionId, type, title, now);
 	}
 
-	// Build entity context for system prompt
-	private buildEntityContext(): string {
-		const entities = this.getKnownEntities();
+	// Build entity context for system prompt (isolated per session)
+	private buildEntityContext(sessionId: string): string {
+		const entities = this.getKnownEntities(sessionId);
 		if (entities.length === 0) return "";
 
 		const lines = entities.map((e) => `- ${e.title} (${e.type} ID: ${e.id})`);
 		return `\n\n## Known Entities (use these IDs for follow-up questions)\n${lines.join("\n")}`;
 	}
 
-	// Extract entities from tool results
-	private extractAndSaveEntities(toolName: string, result: unknown) {
+	// Extract entities from tool results (isolated per session)
+	private extractAndSaveEntities(sessionId: string, toolName: string, result: unknown) {
 		if (!result || typeof result !== "object") return;
 		const data = result as Record<string, unknown>;
 
@@ -430,21 +458,21 @@ export class EGDataAgent extends DurableObject<Env> {
 		if (toolName === "search_offers" && Array.isArray(searchResults)) {
 			for (const hit of searchResults.slice(0, 3)) {
 				if (hit && typeof hit === "object" && "id" in hit && "title" in hit) {
-					this.saveEntity(String(hit.id), "offer", String(hit.title));
+					this.saveEntity(sessionId, String(hit.id), "offer", String(hit.title));
 				}
 			}
 		}
 
 		// Handle single offer details
 		if ((toolName === "get_offer_details" || toolName === "get_offer_price") && data.id && data.title) {
-			this.saveEntity(String(data.id), "offer", String(data.title));
+			this.saveEntity(sessionId, String(data.id), "offer", String(data.title));
 		}
 
 		// Handle offer items
 		if (toolName === "get_offer_items" && Array.isArray(data)) {
 			for (const item of data.slice(0, 3)) {
 				if (item && typeof item === "object" && "id" in item && "title" in item) {
-					this.saveEntity(String(item.id), "item", String(item.title));
+					this.saveEntity(sessionId, String(item.id), "item", String(item.title));
 				}
 			}
 		}
@@ -452,24 +480,27 @@ export class EGDataAgent extends DurableObject<Env> {
 
 	// Handle streaming chat
 	private async handleChatStream(request: Request): Promise<Response> {
-		const body = (await request.json()) as { message: string; userId?: string };
+		const body = (await request.json()) as { message: string; userId?: string; sessionId?: string };
 
 		if (!body.message) {
 			return Response.json({ error: "Message is required" }, { status: 400 });
 		}
 
-		// Set userId if provided
+		// Session ID for conversation-level isolation (defaults to 'default' for backwards compat)
+		const sessionId = body.sessionId || "default";
+
+		// Set userId if provided (user-level context, shared across sessions)
 		if (body.userId && !this.state.userId) {
 			this.state.userId = body.userId;
 			this.saveState();
 		}
 
-		// Get conversation history and add user message
-		const history = this.getConversationHistory();
-		this.addMessage("user", body.message);
+		// Get conversation history for this session and add user message
+		const history = this.getConversationHistory(sessionId);
+		this.addMessage(sessionId, "user", body.message);
 
-		// Build system prompt with context
-		const entityContext = this.buildEntityContext();
+		// Build system prompt with user context (shared) and entity context (per-session)
+		const entityContext = this.buildEntityContext(sessionId);
 		const systemPrompt = getSystemPrompt(this.state) + entityContext;
 
 		// Prepare messages for AI
@@ -513,7 +544,7 @@ export class EGDataAgent extends DurableObject<Env> {
 							}
 							if (chunk.type === "tool-result") {
 								const tr = chunk as { toolName: string; result?: unknown };
-								agent.extractAndSaveEntities(tr.toolName, tr.result);
+								agent.extractAndSaveEntities(sessionId, tr.toolName, tr.result);
 							}
 						},
 					});
@@ -545,7 +576,7 @@ export class EGDataAgent extends DurableObject<Env> {
 
 									// Extract entities from tool results (for follow-up context)
 									if (typedResult.toolName && typedResult.result) {
-										agent.extractAndSaveEntities(typedResult.toolName, typedResult.result);
+										agent.extractAndSaveEntities(sessionId, typedResult.toolName, typedResult.result);
 									}
 
 									// Check for confirmation requests
@@ -592,7 +623,7 @@ export class EGDataAgent extends DurableObject<Env> {
 					);
 
 					if (fullText.trim()) {
-						agent.addMessage("assistant", fullText);
+						agent.addMessage(sessionId, "assistant", fullText);
 					}
 
 					controller.close();
@@ -618,21 +649,24 @@ export class EGDataAgent extends DurableObject<Env> {
 
 	// Handle non-streaming chat
 	private async handleChat(request: Request): Promise<Response> {
-		const body = (await request.json()) as { message: string; userId?: string };
+		const body = (await request.json()) as { message: string; userId?: string; sessionId?: string };
 
 		if (!body.message) {
 			return Response.json({ error: "Message is required" }, { status: 400 });
 		}
+
+		// Session ID for conversation-level isolation
+		const sessionId = body.sessionId || "default";
 
 		if (body.userId && !this.state.userId) {
 			this.state.userId = body.userId;
 			this.saveState();
 		}
 
-		const history = this.getConversationHistory();
-		this.addMessage("user", body.message);
+		const history = this.getConversationHistory(sessionId);
+		this.addMessage(sessionId, "user", body.message);
 
-		const entityContext = this.buildEntityContext();
+		const entityContext = this.buildEntityContext(sessionId);
 		const systemPrompt = getSystemPrompt(this.state) + entityContext;
 
 		const messages = [
@@ -661,13 +695,13 @@ export class EGDataAgent extends DurableObject<Env> {
 				if (step.toolResults) {
 					for (const toolResult of step.toolResults) {
 						const tr = toolResult as { toolName: string; result?: unknown };
-						this.extractAndSaveEntities(tr.toolName, tr.result);
+						this.extractAndSaveEntities(sessionId, tr.toolName, tr.result);
 					}
 				}
 			}
 
 			if (responseText.trim()) {
-				this.addMessage("assistant", responseText);
+				this.addMessage(sessionId, "assistant", responseText);
 			}
 
 			return new Response(responseText, {
@@ -722,10 +756,12 @@ export class EGDataAgent extends DurableObject<Env> {
 		});
 	}
 
-	// Handle clearing conversation
-	private handleClear(): Response {
-		this.sql.exec("DELETE FROM messages");
-		this.sql.exec("DELETE FROM known_entities");
+	// Handle clearing conversation (only clears session-level context, not user preferences)
+	private handleClear(sessionId: string): Response {
+		// Only clear messages and entities for this specific session
+		this.sql.exec("DELETE FROM messages WHERE session_id = ?", sessionId);
+		this.sql.exec("DELETE FROM known_entities WHERE session_id = ?", sessionId);
+		// User-level context (country, language, facts) is preserved
 		return Response.json({ success: true });
 	}
 }

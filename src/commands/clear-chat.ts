@@ -1,37 +1,46 @@
-import { SlashCommandBuilder, type CommandInteraction } from 'discord.js';
+import { SlashCommandBuilder, type CommandInteraction, ChannelType } from 'discord.js';
 import { BaseCommand } from '../types/BaseCommand.js';
-import { userSessionVersions } from './ask.js';
-
-const AI_WORKER_URL = process.env['AI_WORKER_URL'] || 'http://localhost:8787';
+import { threadSessions, AI_WORKER_URL } from './ask.js';
 
 export class ClearChatCommand extends BaseCommand {
   override data = new SlashCommandBuilder()
     .setName('clear-chat')
-    .setDescription('Clear your AI conversation history to start fresh.');
+    .setDescription('Clear the AI conversation history in the current thread.');
 
   override async execute(interaction: CommandInteraction): Promise<void> {
-    const userId = interaction.user.id;
+    this.logger.info(`Clear chat request from ${interaction.user.tag}`);
 
-    this.logger.info(`Clearing AI chat for ${interaction.user.tag}`);
+    // Check if we're in a thread with an active AI session
+    if (interaction.channel?.type === ChannelType.PublicThread ||
+        interaction.channel?.type === ChannelType.PrivateThread) {
+      const sessionId = threadSessions.get(interaction.channel.id);
 
-    // Increment the session version to create a new conversation
-    const currentVersion = userSessionVersions.get(userId) || 0;
-    const oldSessionId = `discord-${userId}-v${currentVersion}`;
-    userSessionVersions.set(userId, currentVersion + 1);
+      if (sessionId) {
+        // Clear the session on the worker side
+        try {
+          await fetch(`${AI_WORKER_URL}/api/clear`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionId }),
+          });
+        } catch {
+          // Ignore errors
+        }
 
-    // Also clear on the worker side
-    try {
-      await fetch(`${AI_WORKER_URL}/api/clear`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ sessionId: oldSessionId }),
-      });
-    } catch {
-      // Ignore errors - the session version change is enough
+        // Remove the thread-session mapping so it's treated as a fresh start
+        threadSessions.delete(interaction.channel.id);
+
+        await interaction.reply({
+          content: 'This thread\'s AI conversation history has been cleared. Future messages in this thread will start a fresh conversation.',
+          ephemeral: true,
+        });
+        return;
+      }
     }
 
+    // Not in an AI thread - inform user that /ask is already fresh
     await interaction.reply({
-      content: 'Your AI conversation history has been cleared. Your next `/ask` will start a fresh conversation.',
+      content: 'Each `/ask` command already starts a fresh conversation. Use `/clear-chat` inside an AI thread to clear that thread\'s conversation history.',
       ephemeral: true,
     });
   }

@@ -9,16 +9,22 @@ type ToolOptions = { abortSignal?: AbortSignal };
 // Max size for tool results to avoid token limits
 const MAX_RESULT_LENGTH = 15000;
 
-// Filter out pre-purchase offers and OTHERS/giveaway offers from arrays
+// Filter out pre-purchase offers and giveaway placeholder offers from arrays
 function filterUnwantedOffers(arr: unknown[]): unknown[] {
 	return arr.filter((item) => {
 		if (typeof item === "object" && item !== null) {
 			const record = item as Record<string, unknown>;
 			// Filter out pre-purchase offers
 			if (record.prePurchase === true) return false;
-			// Filter out OTHERS offers (mystery giveaways, vault items, etc.)
-			// These have dummy items with no asset data
-			if (record.offerType === "OTHERS") return false;
+
+			// Filter out giveaway placeholder offers (mystery games, vault items)
+			// These have dummy items with no real asset data
+			// Identify them by: seller "Epic Dev Test Account" or "freegames/vaulted" category
+			const seller = record.seller as { name?: string } | undefined;
+			if (seller?.name === "Epic Dev Test Account") return false;
+
+			const categories = record.categories as string[] | undefined;
+			if (categories?.includes("freegames/vaulted")) return false;
 		}
 		return true;
 	});
@@ -26,7 +32,7 @@ function filterUnwantedOffers(arr: unknown[]): unknown[] {
 
 // Truncate large objects to reduce token usage and filter unwanted offers
 function truncateResult(obj: unknown): unknown {
-	// First, filter unwanted offers (pre-purchase, OTHERS) from any arrays
+	// First, filter unwanted offers (pre-purchase, giveaway placeholders) from any arrays
 	let filtered = obj;
 	if (Array.isArray(obj)) {
 		filtered = filterUnwantedOffers(obj);

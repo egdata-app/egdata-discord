@@ -10,11 +10,16 @@ import { BaseCommand } from '../types/BaseCommand.js';
 
 export const AI_WORKER_URL = process.env['AI_WORKER_URL'] || 'http://localhost:8787';
 
-// Track session versions per user (resets on bot restart, which is fine)
-export const userSessionVersions = new Map<string, number>();
-
 // Track thread ID to session ID mappings for thread-based chat
+// Each /ask command generates a unique session, threads continue that specific session
 export const threadSessions = new Map<string, string>();
+
+// Generate a unique session ID for each /ask command
+function generateSessionId(userId: string): string {
+  const timestamp = Date.now().toString(36);
+  const random = Math.random().toString(36).substring(2, 8);
+  return `discord-${userId}-${timestamp}-${random}`;
+}
 
 // Store AI-generated thread titles per session
 export const sessionThreadTitles = new Map<string, string>();
@@ -84,10 +89,9 @@ export class AskCommand extends BaseCommand {
       return;
     }
 
-    // Use user ID + version as session ID for conversation continuity
-    const userId = interaction.user.id;
-    const version = userSessionVersions.get(userId) || 0;
-    const sessionId = `discord-${userId}-v${version}`;
+    // Generate a unique session ID for this specific /ask command
+    // Each /ask is isolated; threads continue their own session
+    const sessionId = generateSessionId(interaction.user.id);
 
     this.logger.info(`AI question from ${interaction.user.tag}: ${question}`);
 

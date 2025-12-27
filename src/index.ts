@@ -182,8 +182,8 @@ async function handleButton(interaction: ButtonInteraction) {
     }
   } else if (action === 'confirm_save' && sessionId) {
     // Validate that the user clicking is the owner of the session
-    // Session ID format: discord-{userId}-v{version}
-    const sessionUserMatch = sessionId.match(/^discord-(\d+)-v\d+$/);
+    // Session ID format: discord-{userId}-{timestamp}-{random}
+    const sessionUserMatch = sessionId.match(/^discord-(\d+)-[a-z0-9]+-[a-z0-9]+$/);
     const sessionUserId = sessionUserMatch ? sessionUserMatch[1] : null;
 
     if (sessionUserId && sessionUserId !== interaction.user.id) {
@@ -228,7 +228,7 @@ async function handleButton(interaction: ButtonInteraction) {
     }
   } else if (action === 'reject_save' && sessionId) {
     // Validate that the user clicking is the owner of the session
-    const sessionUserMatch = sessionId.match(/^discord-(\d+)-v\d+$/);
+    const sessionUserMatch = sessionId.match(/^discord-(\d+)-[a-z0-9]+-[a-z0-9]+$/);
     const sessionUserId = sessionUserMatch ? sessionUserMatch[1] : null;
 
     if (sessionUserId && sessionUserId !== interaction.user.id) {
