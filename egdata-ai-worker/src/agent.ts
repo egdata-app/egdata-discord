@@ -1,10 +1,10 @@
-import { DurableObject } from "cloudflare:workers";
+import { Agent } from "agents";
 import { streamText, tool, stepCountIs } from "ai";
 import { mistral } from "@ai-sdk/mistral";
 import { z } from "zod";
 import { egdataTools } from "./tools";
 
-// User-level state persisted across all conversations
+// User-level state persisted across all conversations (managed by Agent.state)
 interface UserState {
 	userId: string;
 	country?: string;
@@ -20,6 +20,12 @@ interface UserState {
 		message: string;
 	};
 }
+
+// Initial state for new agents
+const initialState: UserState = {
+	userId: "",
+	facts: [],
+};
 
 // Human-readable tool names for progress updates
 const TOOL_DESCRIPTIONS: Record<string, string> = {
@@ -322,52 +328,16 @@ interface ChatMessage {
 	sessionId: string;
 }
 
-export class EGDataAgent extends DurableObject<Env> {
-	// User-level state (persists across all sessions for this user)
-	private userState: UserState = {
-		userId: "",
-		facts: [],
-	};
-	private sql: SqlStorage;
+export class EGDataAgent extends Agent<Env, UserState> {
+	// Initial state for new agents
+	initialState: UserState = initialState;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
-		this.sql = ctx.storage.sql;
-
-		// Initialize user state table
-		this.sql.exec(`
-			CREATE TABLE IF NOT EXISTS user_state (
-				key TEXT PRIMARY KEY,
-				value TEXT NOT NULL
-			)
-		`);
-
-		// Check schema version and migrate if needed
-		const SCHEMA_VERSION = 2; // Increment this when schema changes
-		let currentVersion = 0;
-		try {
-			const rows = this.sql
-				.exec(`SELECT value FROM user_state WHERE key = 'schema_version'`)
-				.toArray() as { value: string }[];
-			if (rows.length > 0) {
-				currentVersion = parseInt(rows[0].value, 10) || 0;
-			}
-		} catch {
-			// Table might not exist yet
-		}
-
-		if (currentVersion < SCHEMA_VERSION) {
-			// Drop old tables and recreate with new schema
-			this.sql.exec(`DROP TABLE IF EXISTS messages`);
-			this.sql.exec(`DROP TABLE IF EXISTS known_entities`);
-			this.sql.exec(
-				`INSERT OR REPLACE INTO user_state (key, value) VALUES ('schema_version', ?)`,
-				String(SCHEMA_VERSION)
-			);
-		}
 
 		// Initialize messages table (per-session context)
-		this.sql.exec(`
+		// Messages need SQL for querying by session, state doesn't support this
+		this.sql`
 			CREATE TABLE IF NOT EXISTS messages (
 				id TEXT PRIMARY KEY,
 				session_id TEXT NOT NULL,
@@ -375,10 +345,10 @@ export class EGDataAgent extends DurableObject<Env> {
 				content TEXT NOT NULL,
 				timestamp INTEGER NOT NULL
 			)
-		`);
+		`;
 
 		// Initialize known entities table (per-session context)
-		this.sql.exec(`
+		this.sql`
 			CREATE TABLE IF NOT EXISTS known_entities (
 				id TEXT NOT NULL,
 				session_id TEXT NOT NULL,
@@ -387,26 +357,19 @@ export class EGDataAgent extends DurableObject<Env> {
 				last_used INTEGER NOT NULL,
 				PRIMARY KEY (id, session_id)
 			)
-		`);
-
-		// Load user state from SQL
-		this.loadUserState();
+		`;
 	}
 
 	// Get recent conversation history from SQL (isolated per session)
 	private getConversationHistory(sessionId: string, limit = 20): ChatMessage[] {
-		const rows = this.sql
-			.exec(
-				`SELECT id, role, content, timestamp, session_id as sessionId
-				FROM messages
-				WHERE session_id = ?
-				ORDER BY timestamp DESC
-				LIMIT ?`,
-				sessionId,
-				limit
-			)
-			.toArray() as unknown as ChatMessage[];
-		return rows.reverse();
+		const rows = this.sql<ChatMessage>`
+			SELECT id, role, content, timestamp, session_id as sessionId
+			FROM messages
+			WHERE session_id = ${sessionId}
+			ORDER BY timestamp DESC
+			LIMIT ${limit}
+		`;
+		return [...rows].reverse();
 	}
 
 	// Add message to conversation history (isolated per session)
@@ -417,90 +380,41 @@ export class EGDataAgent extends DurableObject<Env> {
 	): string {
 		const id = crypto.randomUUID();
 		const timestamp = Date.now();
-		this.sql.exec(
-			`INSERT INTO messages (id, session_id, role, content, timestamp)
-			VALUES (?, ?, ?, ?, ?)`,
-			id,
-			sessionId,
-			role,
-			content,
-			timestamp
-		);
+		this.sql`
+			INSERT INTO messages (id, session_id, role, content, timestamp)
+			VALUES (${id}, ${sessionId}, ${role}, ${content}, ${timestamp})
+		`;
 
 		// Keep only last 50 messages per session
-		this.sql.exec(
-			`DELETE FROM messages
-			WHERE session_id = ? AND id NOT IN (
-				SELECT id FROM messages WHERE session_id = ? ORDER BY timestamp DESC LIMIT 50
-			)`,
-			sessionId,
-			sessionId
-		);
+		this.sql`
+			DELETE FROM messages
+			WHERE session_id = ${sessionId} AND id NOT IN (
+				SELECT id FROM messages WHERE session_id = ${sessionId} ORDER BY timestamp DESC LIMIT 50
+			)
+		`;
 
 		return id;
 	}
 
-	private loadUserState() {
-		const rows = this.sql
-			.exec(`SELECT key, value FROM user_state`)
-			.toArray() as { key: string; value: string }[];
-		for (const row of rows) {
-			if (row.key === "country") this.userState.country = row.value;
-			if (row.key === "language") this.userState.language = row.value;
-			if (row.key === "userId") this.userState.userId = row.value;
-			if (row.key === "facts") this.userState.facts = JSON.parse(row.value);
-			if (row.key === "pendingConfirmation")
-				this.userState.pendingConfirmation = JSON.parse(row.value);
-		}
-	}
-
-	private saveUserState() {
-		if (this.userState.country) {
-			this.sql.exec(
-				`INSERT OR REPLACE INTO user_state (key, value) VALUES ('country', ?)`,
-				this.userState.country
-			);
-		}
-		if (this.userState.language) {
-			this.sql.exec(
-				`INSERT OR REPLACE INTO user_state (key, value) VALUES ('language', ?)`,
-				this.userState.language
-			);
-		}
-		if (this.userState.userId) {
-			this.sql.exec(
-				`INSERT OR REPLACE INTO user_state (key, value) VALUES ('userId', ?)`,
-				this.userState.userId
-			);
-		}
-		this.sql.exec(
-			`INSERT OR REPLACE INTO user_state (key, value) VALUES ('facts', ?)`,
-			JSON.stringify(this.userState.facts)
-		);
-		if (this.userState.pendingConfirmation) {
-			this.sql.exec(
-				`INSERT OR REPLACE INTO user_state (key, value) VALUES ('pendingConfirmation', ?)`,
-				JSON.stringify(this.userState.pendingConfirmation)
-			);
-		} else {
-			this.sql.exec(`DELETE FROM user_state WHERE key = 'pendingConfirmation'`);
-		}
+	// Update user state using Agent's built-in state management
+	private updateState(updates: Partial<UserState>) {
+		this.setState({
+			...this.state,
+			...updates,
+		});
 	}
 
 	// Get known entities for context (isolated per session)
 	private getKnownEntities(
 		sessionId: string
 	): Array<{ id: string; type: string; title: string }> {
-		return this.sql
-			.exec(
-				`SELECT id, type, title
-				FROM known_entities
-				WHERE session_id = ?
-				ORDER BY last_used DESC
-				LIMIT 5`,
-				sessionId
-			)
-			.toArray() as Array<{ id: string; type: string; title: string }>;
+		return this.sql<{ id: string; type: string; title: string }>`
+			SELECT id, type, title
+			FROM known_entities
+			WHERE session_id = ${sessionId}
+			ORDER BY last_used DESC
+			LIMIT 5
+		`;
 	}
 
 	// Save known entity (isolated per session)
@@ -511,15 +425,10 @@ export class EGDataAgent extends DurableObject<Env> {
 		title: string
 	) {
 		const now = Date.now();
-		this.sql.exec(
-			`INSERT OR REPLACE INTO known_entities (id, session_id, type, title, last_used)
-			VALUES (?, ?, ?, ?, ?)`,
-			id,
-			sessionId,
-			type,
-			title,
-			now
-		);
+		this.sql`
+			INSERT OR REPLACE INTO known_entities (id, session_id, type, title, last_used)
+			VALUES (${id}, ${sessionId}, ${type}, ${title}, ${now})
+		`;
 	}
 
 	// Build entity context for system prompt (isolated per session)
@@ -585,7 +494,7 @@ export class EGDataAgent extends DurableObject<Env> {
 
 		// Health check
 		if (url.pathname === "/health") {
-			return Response.json({ status: "ok", userId: this.userState.userId });
+			return Response.json({ status: "ok", userId: this.state.userId });
 		}
 
 		// Confirm pending save
@@ -635,7 +544,7 @@ export class EGDataAgent extends DurableObject<Env> {
 
 		// Build system prompt with user context and entity context
 		const entityContext = this.buildEntityContext(sessionId);
-		const systemPrompt = getSystemPrompt(this.userState) + entityContext;
+		const systemPrompt = getSystemPrompt(this.state) + entityContext;
 
 		// All tools including the propose_save_context tool
 		const allTools = {
@@ -712,14 +621,15 @@ export class EGDataAgent extends DurableObject<Env> {
 											};
 										};
 										if (output?.type === "confirmation_required") {
-											agent.userState.pendingConfirmation = {
-												type: "save_context",
-												data: output.data || {},
-												message:
-													output.message ||
-													"Would you like me to remember this?",
-											};
-											agent.saveUserState();
+											agent.updateState({
+												pendingConfirmation: {
+													type: "save_context",
+													data: output.data || {},
+													message:
+														output.message ||
+														"Would you like me to remember this?",
+												},
+											});
 											pendingConfirmation = {
 												message:
 													output.message ||
@@ -804,7 +714,7 @@ export class EGDataAgent extends DurableObject<Env> {
 
 		// Build system prompt with user context and entity context
 		const entityContext = this.buildEntityContext(sessionId);
-		const systemPrompt = getSystemPrompt(this.userState) + entityContext;
+		const systemPrompt = getSystemPrompt(this.state) + entityContext;
 
 		// All tools including the propose_save_context tool
 		const allTools = {
@@ -866,27 +776,25 @@ export class EGDataAgent extends DurableObject<Env> {
 
 	// Handle confirmation of pending save
 	private handleConfirm(): Response {
-		const pending = this.userState.pendingConfirmation;
+		const pending = this.state.pendingConfirmation;
 
 		if (!pending || pending.type !== "save_context") {
 			return Response.json({ error: "No pending confirmation" }, { status: 400 });
 		}
 
 		const { country, language, fact } = pending.data;
+		const updates: Partial<UserState> = { pendingConfirmation: undefined };
 
-		if (country) this.userState.country = country;
-		if (language) this.userState.language = language;
+		if (country) updates.country = country;
+		if (language) updates.language = language;
 		if (fact) {
-			if (!this.userState.facts.includes(fact)) {
-				this.userState.facts.push(fact);
-				if (this.userState.facts.length > 10) {
-					this.userState.facts = this.userState.facts.slice(-10);
-				}
+			const currentFacts = this.state.facts || [];
+			if (!currentFacts.includes(fact)) {
+				updates.facts = [...currentFacts, fact].slice(-10);
 			}
 		}
 
-		this.userState.pendingConfirmation = undefined;
-		this.saveUserState();
+		this.updateState(updates);
 
 		return Response.json({
 			success: true,
@@ -897,8 +805,7 @@ export class EGDataAgent extends DurableObject<Env> {
 
 	// Handle rejection of pending save
 	private handleReject(): Response {
-		this.userState.pendingConfirmation = undefined;
-		this.saveUserState();
+		this.updateState({ pendingConfirmation: undefined });
 		return Response.json({
 			success: true,
 			message: "No problem, I won't save that.",
@@ -908,9 +815,9 @@ export class EGDataAgent extends DurableObject<Env> {
 	// Handle clearing conversation (only clears session-level context, not user preferences)
 	private handleClear(sessionId: string): Response {
 		// Clear messages for this session
-		this.sql.exec(`DELETE FROM messages WHERE session_id = ?`, sessionId);
+		this.sql`DELETE FROM messages WHERE session_id = ${sessionId}`;
 		// Clear known entities for this session
-		this.sql.exec(`DELETE FROM known_entities WHERE session_id = ?`, sessionId);
+		this.sql`DELETE FROM known_entities WHERE session_id = ${sessionId}`;
 		return Response.json({ success: true });
 	}
 }
