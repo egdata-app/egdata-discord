@@ -202,7 +202,7 @@ export class AskCommand extends BaseCommand {
   ): Promise<void> {
     // Use plain text for progress updates (less intrusive than embeds)
     await interaction.editReply({
-      content: `⏳ ${status}`,
+      content: `*⏳ ${status}*`,
       embeds: []
     }).catch(() => {
       // Ignore errors from rate limiting

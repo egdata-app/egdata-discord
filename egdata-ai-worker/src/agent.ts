@@ -1,11 +1,11 @@
 import { DurableObject } from "cloudflare:workers";
-import { streamText, generateText, stepCountIs, tool } from "ai";
+import { streamText, tool, stepCountIs } from "ai";
 import { mistral } from "@ai-sdk/mistral";
 import { z } from "zod";
 import { egdataTools } from "./tools";
 
-// Agent state persisted across requests
-interface AgentState {
+// User-level state persisted across all conversations
+interface UserState {
 	userId: string;
 	country?: string;
 	language?: string;
@@ -19,13 +19,6 @@ interface AgentState {
 		};
 		message: string;
 	};
-}
-
-// Message format for conversation history
-interface ChatMessage {
-	role: "user" | "assistant";
-	content: string;
-	timestamp: number;
 }
 
 // Human-readable tool names for progress updates
@@ -56,11 +49,12 @@ const TOOL_DESCRIPTIONS: Record<string, string> = {
 	get_offers_items: "Getting items for multiple games...",
 	get_item_assets: "Checking download size...",
 	get_items_assets: "Checking download sizes for multiple games...",
+	get_top_giveaway_publishers: "Checking top giveaway publishers...",
 	propose_save_context: "Preparing to remember...",
 };
 
 // Generate system prompt with current date and user context
-function getSystemPrompt(state: AgentState): string {
+function getSystemPrompt(userState: UserState): string {
 	const now = new Date();
 	const dateStr = now.toLocaleDateString("en-US", {
 		weekday: "long",
@@ -71,11 +65,22 @@ function getSystemPrompt(state: AgentState): string {
 
 	let userContext = "";
 	const contextParts: string[] = [];
-	if (state.country) contextParts.push(`- User's country: ${state.country} (use this for pricing) - ALREADY SAVED, don't propose saving again`);
-	if (state.language) contextParts.push(`- User's preferred language: ${state.language} - ALREADY SAVED, don't propose saving again`);
-	if (state.facts.length > 0) contextParts.push(`- Things user has shared: ${state.facts.join("; ")} - ALREADY SAVED`);
-	if (state.pendingConfirmation) {
-		contextParts.push(`- PENDING CONFIRMATION: ${state.pendingConfirmation.message} - DO NOT propose saving the same info again, wait for user to confirm/reject`);
+	if (userState.country)
+		contextParts.push(
+			`- User's country: ${userState.country} (use this for pricing) - ALREADY SAVED, don't propose saving again`
+		);
+	if (userState.language)
+		contextParts.push(
+			`- User's preferred language: ${userState.language} - ALREADY SAVED, don't propose saving again`
+		);
+	if (userState.facts.length > 0)
+		contextParts.push(
+			`- Things user has shared: ${userState.facts.join("; ")} - ALREADY SAVED`
+		);
+	if (userState.pendingConfirmation) {
+		contextParts.push(
+			`- PENDING CONFIRMATION: ${userState.pendingConfirmation.message} - DO NOT propose saving the same info again, wait for user to confirm/reject`
+		);
 	}
 	if (contextParts.length > 0) {
 		userContext = `\n\n## User Context (remembered from previous conversations)\n${contextParts.join("\n")}`;
@@ -278,12 +283,23 @@ const proposeSaveContextTool = tool({
 	description:
 		"Propose saving information about the user for future conversations. Use this when the user tells you their country, language, or preferences. The user will be asked to confirm before saving.",
 	inputSchema: z.object({
-		country: z.string().optional().describe("User's country code (e.g., 'ES' for Spain, 'US' for USA)"),
+		country: z
+			.string()
+			.optional()
+			.describe("User's country code (e.g., 'ES' for Spain, 'US' for USA)"),
 		language: z.string().optional().describe("User's preferred language"),
-		fact: z.string().optional().describe("A preference or fact about the user (e.g., 'loves roguelike games')"),
+		fact: z
+			.string()
+			.optional()
+			.describe(
+				"A preference or fact about the user (e.g., 'loves roguelike games')"
+			),
 	}),
-	execute: async ({ country, language, fact }: { country?: string; language?: string; fact?: string }) => {
-		// This doesn't actually save - it returns a proposal for the user to confirm
+	execute: async ({
+		country,
+		language,
+		fact,
+	}: { country?: string; language?: string; fact?: string }) => {
 		const parts: string[] = [];
 		if (country) parts.push(`country: ${country}`);
 		if (language) parts.push(`language: ${language}`);
@@ -297,25 +313,63 @@ const proposeSaveContextTool = tool({
 	},
 });
 
+// Message format for conversation history
+interface ChatMessage {
+	id: string;
+	role: "user" | "assistant";
+	content: string;
+	timestamp: number;
+	sessionId: string;
+}
+
 export class EGDataAgent extends DurableObject<Env> {
-	private state: AgentState;
+	// User-level state (persists across all sessions for this user)
+	private userState: UserState = {
+		userId: "",
+		facts: [],
+	};
 	private sql: SqlStorage;
 
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 		this.sql = ctx.storage.sql;
 
-		// Initialize state from storage or use defaults
-		this.state = {
-			userId: "",
-			facts: [],
-		};
+		// Initialize user state table
+		this.sql.exec(`
+			CREATE TABLE IF NOT EXISTS user_state (
+				key TEXT PRIMARY KEY,
+				value TEXT NOT NULL
+			)
+		`);
 
-		// Initialize SQL tables with session isolation
-		// Messages are isolated per session (conversation-level context)
+		// Check schema version and migrate if needed
+		const SCHEMA_VERSION = 2; // Increment this when schema changes
+		let currentVersion = 0;
+		try {
+			const rows = this.sql
+				.exec(`SELECT value FROM user_state WHERE key = 'schema_version'`)
+				.toArray() as { value: string }[];
+			if (rows.length > 0) {
+				currentVersion = parseInt(rows[0].value, 10) || 0;
+			}
+		} catch {
+			// Table might not exist yet
+		}
+
+		if (currentVersion < SCHEMA_VERSION) {
+			// Drop old tables and recreate with new schema
+			this.sql.exec(`DROP TABLE IF EXISTS messages`);
+			this.sql.exec(`DROP TABLE IF EXISTS known_entities`);
+			this.sql.exec(
+				`INSERT OR REPLACE INTO user_state (key, value) VALUES ('schema_version', ?)`,
+				String(SCHEMA_VERSION)
+			);
+		}
+
+		// Initialize messages table (per-session context)
 		this.sql.exec(`
 			CREATE TABLE IF NOT EXISTS messages (
-				id INTEGER PRIMARY KEY AUTOINCREMENT,
+				id TEXT PRIMARY KEY,
 				session_id TEXT NOT NULL,
 				role TEXT NOT NULL,
 				content TEXT NOT NULL,
@@ -323,14 +377,7 @@ export class EGDataAgent extends DurableObject<Env> {
 			)
 		`);
 
-		// Add session_id column if it doesn't exist (migration for existing data)
-		try {
-			this.sql.exec(`ALTER TABLE messages ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`);
-		} catch {
-			// Column already exists
-		}
-
-		// Known entities are isolated per session (conversation-level context)
+		// Initialize known entities table (per-session context)
 		this.sql.exec(`
 			CREATE TABLE IF NOT EXISTS known_entities (
 				id TEXT NOT NULL,
@@ -342,52 +389,193 @@ export class EGDataAgent extends DurableObject<Env> {
 			)
 		`);
 
-		// Migration: add session_id to known_entities if needed
-		try {
-			this.sql.exec(`ALTER TABLE known_entities ADD COLUMN session_id TEXT NOT NULL DEFAULT ''`);
-		} catch {
-			// Column already exists
-		}
+		// Load user state from SQL
+		this.loadUserState();
+	}
 
-		this.sql.exec(`
-			CREATE TABLE IF NOT EXISTS user_state (
-				key TEXT PRIMARY KEY,
-				value TEXT NOT NULL
+	// Get recent conversation history from SQL (isolated per session)
+	private getConversationHistory(sessionId: string, limit = 20): ChatMessage[] {
+		const rows = this.sql
+			.exec(
+				`SELECT id, role, content, timestamp, session_id as sessionId
+				FROM messages
+				WHERE session_id = ?
+				ORDER BY timestamp DESC
+				LIMIT ?`,
+				sessionId,
+				limit
 			)
-		`);
-
-		// Load state from SQL
-		this.loadState();
+			.toArray() as unknown as ChatMessage[];
+		return rows.reverse();
 	}
 
-	private loadState() {
-		const rows = this.sql.exec("SELECT key, value FROM user_state").toArray();
+	// Add message to conversation history (isolated per session)
+	private addMessage(
+		sessionId: string,
+		role: "user" | "assistant",
+		content: string
+	): string {
+		const id = crypto.randomUUID();
+		const timestamp = Date.now();
+		this.sql.exec(
+			`INSERT INTO messages (id, session_id, role, content, timestamp)
+			VALUES (?, ?, ?, ?, ?)`,
+			id,
+			sessionId,
+			role,
+			content,
+			timestamp
+		);
+
+		// Keep only last 50 messages per session
+		this.sql.exec(
+			`DELETE FROM messages
+			WHERE session_id = ? AND id NOT IN (
+				SELECT id FROM messages WHERE session_id = ? ORDER BY timestamp DESC LIMIT 50
+			)`,
+			sessionId,
+			sessionId
+		);
+
+		return id;
+	}
+
+	private loadUserState() {
+		const rows = this.sql
+			.exec(`SELECT key, value FROM user_state`)
+			.toArray() as { key: string; value: string }[];
 		for (const row of rows) {
-			const key = row.key as string;
-			const value = row.value as string;
-			if (key === "country") this.state.country = value;
-			if (key === "language") this.state.language = value;
-			if (key === "userId") this.state.userId = value;
-			if (key === "facts") this.state.facts = JSON.parse(value);
-			if (key === "pendingConfirmation") this.state.pendingConfirmation = JSON.parse(value);
+			if (row.key === "country") this.userState.country = row.value;
+			if (row.key === "language") this.userState.language = row.value;
+			if (row.key === "userId") this.userState.userId = row.value;
+			if (row.key === "facts") this.userState.facts = JSON.parse(row.value);
+			if (row.key === "pendingConfirmation")
+				this.userState.pendingConfirmation = JSON.parse(row.value);
 		}
 	}
 
-	private saveState() {
-		if (this.state.country) {
-			this.sql.exec("INSERT OR REPLACE INTO user_state (key, value) VALUES ('country', ?)", this.state.country);
+	private saveUserState() {
+		if (this.userState.country) {
+			this.sql.exec(
+				`INSERT OR REPLACE INTO user_state (key, value) VALUES ('country', ?)`,
+				this.userState.country
+			);
 		}
-		if (this.state.language) {
-			this.sql.exec("INSERT OR REPLACE INTO user_state (key, value) VALUES ('language', ?)", this.state.language);
+		if (this.userState.language) {
+			this.sql.exec(
+				`INSERT OR REPLACE INTO user_state (key, value) VALUES ('language', ?)`,
+				this.userState.language
+			);
 		}
-		if (this.state.userId) {
-			this.sql.exec("INSERT OR REPLACE INTO user_state (key, value) VALUES ('userId', ?)", this.state.userId);
+		if (this.userState.userId) {
+			this.sql.exec(
+				`INSERT OR REPLACE INTO user_state (key, value) VALUES ('userId', ?)`,
+				this.userState.userId
+			);
 		}
-		this.sql.exec("INSERT OR REPLACE INTO user_state (key, value) VALUES ('facts', ?)", JSON.stringify(this.state.facts));
-		if (this.state.pendingConfirmation) {
-			this.sql.exec("INSERT OR REPLACE INTO user_state (key, value) VALUES ('pendingConfirmation', ?)", JSON.stringify(this.state.pendingConfirmation));
+		this.sql.exec(
+			`INSERT OR REPLACE INTO user_state (key, value) VALUES ('facts', ?)`,
+			JSON.stringify(this.userState.facts)
+		);
+		if (this.userState.pendingConfirmation) {
+			this.sql.exec(
+				`INSERT OR REPLACE INTO user_state (key, value) VALUES ('pendingConfirmation', ?)`,
+				JSON.stringify(this.userState.pendingConfirmation)
+			);
 		} else {
-			this.sql.exec("DELETE FROM user_state WHERE key = 'pendingConfirmation'");
+			this.sql.exec(`DELETE FROM user_state WHERE key = 'pendingConfirmation'`);
+		}
+	}
+
+	// Get known entities for context (isolated per session)
+	private getKnownEntities(
+		sessionId: string
+	): Array<{ id: string; type: string; title: string }> {
+		return this.sql
+			.exec(
+				`SELECT id, type, title
+				FROM known_entities
+				WHERE session_id = ?
+				ORDER BY last_used DESC
+				LIMIT 5`,
+				sessionId
+			)
+			.toArray() as Array<{ id: string; type: string; title: string }>;
+	}
+
+	// Save known entity (isolated per session)
+	private saveEntity(
+		sessionId: string,
+		id: string,
+		type: string,
+		title: string
+	) {
+		const now = Date.now();
+		this.sql.exec(
+			`INSERT OR REPLACE INTO known_entities (id, session_id, type, title, last_used)
+			VALUES (?, ?, ?, ?, ?)`,
+			id,
+			sessionId,
+			type,
+			title,
+			now
+		);
+	}
+
+	// Build entity context for system prompt (isolated per session)
+	private buildEntityContext(sessionId: string): string {
+		const entities = this.getKnownEntities(sessionId);
+		if (entities.length === 0) return "";
+
+		const lines = entities.map((e) => `- ${e.title} (${e.type} ID: ${e.id})`);
+		return `\n\n## Known Entities (use these IDs for follow-up questions)\n${lines.join("\n")}`;
+	}
+
+	// Extract entities from tool results
+	private extractAndSaveEntities(
+		sessionId: string,
+		toolName: string,
+		result: unknown
+	) {
+		if (!result || typeof result !== "object") return;
+		const data = result as Record<string, unknown>;
+
+		// Handle search results
+		const searchResults = data.offers || data.hits || data.elements;
+		if (toolName === "search_offers" && Array.isArray(searchResults)) {
+			for (const hit of searchResults.slice(0, 3)) {
+				if (hit && typeof hit === "object" && "id" in hit && "title" in hit) {
+					this.saveEntity(
+						sessionId,
+						String(hit.id),
+						"offer",
+						String(hit.title)
+					);
+				}
+			}
+		}
+
+		// Handle single offer details
+		if (
+			(toolName === "get_offer_details" || toolName === "get_offer_price") &&
+			data.id &&
+			data.title
+		) {
+			this.saveEntity(sessionId, String(data.id), "offer", String(data.title));
+		}
+
+		// Handle offer items
+		if (toolName === "get_offer_items" && Array.isArray(data)) {
+			for (const item of data.slice(0, 3)) {
+				if (item && typeof item === "object" && "id" in item && "title" in item) {
+					this.saveEntity(
+						sessionId,
+						String(item.id),
+						"item",
+						String(item.title)
+					);
+				}
+			}
 		}
 	}
 
@@ -397,12 +585,12 @@ export class EGDataAgent extends DurableObject<Env> {
 
 		// Health check
 		if (url.pathname === "/health") {
-			return Response.json({ status: "ok", userId: this.state.userId });
+			return Response.json({ status: "ok", userId: this.userState.userId });
 		}
 
 		// Confirm pending save
 		if (url.pathname === "/api/confirm" && request.method === "POST") {
-			return this.handleConfirm(request);
+			return this.handleConfirm();
 		}
 
 		// Reject pending save
@@ -417,146 +605,37 @@ export class EGDataAgent extends DurableObject<Env> {
 			return this.handleClear(sessionId);
 		}
 
-		// Chat endpoint (streaming)
+		// Custom streaming endpoint for Discord bot (SSE format)
 		if (url.pathname === "/api/chat/stream" && request.method === "POST") {
 			return this.handleChatStream(request);
 		}
 
-		// Chat endpoint (non-streaming)
+		// Non-streaming chat endpoint
 		if (url.pathname === "/api/chat" && request.method === "POST") {
 			return this.handleChat(request);
 		}
 
-		return Response.json({ error: "Not found" }, { status: 404 });
+		// Unknown endpoint
+		return new Response("Not found", { status: 404 });
 	}
 
-	// Get recent conversation history from SQL (isolated per session)
-	private getConversationHistory(sessionId: string, limit = 10): ChatMessage[] {
-		const rows = this.sql.exec(`
-			SELECT role, content, timestamp
-			FROM messages
-			WHERE session_id = ?
-			ORDER BY timestamp DESC
-			LIMIT ?
-		`, sessionId, limit).toArray();
-		return rows.reverse().map(row => ({
-			role: row.role as "user" | "assistant",
-			content: row.content as string,
-			timestamp: row.timestamp as number,
-		}));
-	}
-
-	// Add message to conversation history (isolated per session)
-	private addMessage(sessionId: string, role: "user" | "assistant", content: string) {
-		const timestamp = Date.now();
-		this.sql.exec(`
-			INSERT INTO messages (session_id, role, content, timestamp)
-			VALUES (?, ?, ?, ?)
-		`, sessionId, role, content, timestamp);
-
-		// Keep only last 50 messages per session
-		this.sql.exec(`
-			DELETE FROM messages
-			WHERE session_id = ? AND id NOT IN (
-				SELECT id FROM messages WHERE session_id = ? ORDER BY timestamp DESC LIMIT 50
-			)
-		`, sessionId, sessionId);
-	}
-
-	// Get known entities for context (isolated per session)
-	private getKnownEntities(sessionId: string): Array<{ id: string; type: string; title: string }> {
-		const rows = this.sql.exec(`
-			SELECT id, type, title
-			FROM known_entities
-			WHERE session_id = ?
-			ORDER BY last_used DESC
-			LIMIT 5
-		`, sessionId).toArray();
-		return rows.map(row => ({
-			id: row.id as string,
-			type: row.type as string,
-			title: row.title as string,
-		}));
-	}
-
-	// Save known entity (isolated per session)
-	private saveEntity(sessionId: string, id: string, type: string, title: string) {
-		const now = Date.now();
-		this.sql.exec(`
-			INSERT OR REPLACE INTO known_entities (id, session_id, type, title, last_used)
-			VALUES (?, ?, ?, ?, ?)
-		`, id, sessionId, type, title, now);
-	}
-
-	// Build entity context for system prompt (isolated per session)
-	private buildEntityContext(sessionId: string): string {
-		const entities = this.getKnownEntities(sessionId);
-		if (entities.length === 0) return "";
-
-		const lines = entities.map((e) => `- ${e.title} (${e.type} ID: ${e.id})`);
-		return `\n\n## Known Entities (use these IDs for follow-up questions)\n${lines.join("\n")}`;
-	}
-
-	// Extract entities from tool results (isolated per session)
-	private extractAndSaveEntities(sessionId: string, toolName: string, result: unknown) {
-		if (!result || typeof result !== "object") return;
-		const data = result as Record<string, unknown>;
-
-		// Handle search results
-		const searchResults = data.offers || data.hits || data.elements;
-		if (toolName === "search_offers" && Array.isArray(searchResults)) {
-			for (const hit of searchResults.slice(0, 3)) {
-				if (hit && typeof hit === "object" && "id" in hit && "title" in hit) {
-					this.saveEntity(sessionId, String(hit.id), "offer", String(hit.title));
-				}
-			}
-		}
-
-		// Handle single offer details
-		if ((toolName === "get_offer_details" || toolName === "get_offer_price") && data.id && data.title) {
-			this.saveEntity(sessionId, String(data.id), "offer", String(data.title));
-		}
-
-		// Handle offer items
-		if (toolName === "get_offer_items" && Array.isArray(data)) {
-			for (const item of data.slice(0, 3)) {
-				if (item && typeof item === "object" && "id" in item && "title" in item) {
-					this.saveEntity(sessionId, String(item.id), "item", String(item.title));
-				}
-			}
-		}
-	}
-
-	// Handle streaming chat
+	// Handle streaming chat with SSE format for Discord bot
 	private async handleChatStream(request: Request): Promise<Response> {
-		const body = (await request.json()) as { message: string; userId?: string; sessionId?: string };
+		const body = (await request.json()) as {
+			message: string;
+			sessionId?: string;
+			userId?: string;
+		};
 
 		if (!body.message) {
 			return Response.json({ error: "Message is required" }, { status: 400 });
 		}
 
-		// Session ID for conversation-level isolation (defaults to 'default' for backwards compat)
 		const sessionId = body.sessionId || "default";
 
-		// Set userId if provided (user-level context, shared across sessions)
-		if (body.userId && !this.state.userId) {
-			this.state.userId = body.userId;
-			this.saveState();
-		}
-
-		// Get conversation history for this session and add user message
-		const history = this.getConversationHistory(sessionId);
-		this.addMessage(sessionId, "user", body.message);
-
-		// Build system prompt with user context (shared) and entity context (per-session)
+		// Build system prompt with user context and entity context
 		const entityContext = this.buildEntityContext(sessionId);
-		const systemPrompt = getSystemPrompt(this.state) + entityContext;
-
-		// Prepare messages for AI
-		const messages = [
-			...history.map((m) => ({ role: m.role, content: m.content })),
-			{ role: "user" as const, content: body.message },
-		];
+		const systemPrompt = getSystemPrompt(this.userState) + entityContext;
 
 		// All tools including the propose_save_context tool
 		const allTools = {
@@ -564,36 +643,92 @@ export class EGDataAgent extends DurableObject<Env> {
 			propose_save_context: proposeSaveContextTool,
 		};
 
-		const encoder = new TextEncoder();
 		const agent = this;
+		const encoder = new TextEncoder();
+		const seenTools = new Set<string>();
+
+		// Get conversation history and add user message
+		const history = this.getConversationHistory(sessionId);
+		this.addMessage(sessionId, "user", body.message);
+
+		// Convert to model messages format
+		const modelMessages = [
+			...history.map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
+			{ role: "user" as const, content: body.message },
+		];
 
 		const stream = new ReadableStream({
 			async start(controller) {
 				try {
-					const seenTools = new Set<string>();
+					let pendingConfirmation:
+						| {
+								message: string;
+								data: { country?: string; language?: string; fact?: string };
+						  }
+						| undefined;
 
 					const result = streamText({
 						model: mistral("mistral-large-latest"),
 						system: systemPrompt,
-						messages,
+						messages: modelMessages,
 						tools: allTools,
 						stopWhen: stepCountIs(10),
-						onChunk: ({ chunk }) => {
-							if (chunk.type === "tool-call") {
-								const toolName = chunk.toolName;
-								if (!seenTools.has(toolName)) {
-									seenTools.add(toolName);
-									const description = TOOL_DESCRIPTIONS[toolName] || `Using ${toolName}...`;
-									controller.enqueue(
-										encoder.encode(
-											`data: ${JSON.stringify({ type: "tool", tool: toolName, message: description })}\n\n`
-										)
-									);
+						onStepFinish: async ({ toolCalls, toolResults }) => {
+							// Send tool progress events
+							if (toolCalls) {
+								for (const tc of toolCalls) {
+									if (!seenTools.has(tc.toolName)) {
+										seenTools.add(tc.toolName);
+										const description =
+											TOOL_DESCRIPTIONS[tc.toolName] ||
+											`Using ${tc.toolName}...`;
+										controller.enqueue(
+											encoder.encode(
+												`data: ${JSON.stringify({
+													type: "tool",
+													tool: tc.toolName,
+													message: description,
+												})}\n\n`
+											)
+										);
+									}
 								}
 							}
-							if (chunk.type === "tool-result") {
-								const tr = chunk as { toolName: string; result?: unknown };
-								agent.extractAndSaveEntities(sessionId, tr.toolName, tr.result);
+
+							// Extract entities and check for confirmations from tool results
+							if (toolResults) {
+								for (const tr of toolResults) {
+									agent.extractAndSaveEntities(sessionId, tr.toolName, tr.output);
+
+									// Check for confirmation requests
+									if (tr.toolName === "propose_save_context") {
+										const output = tr.output as {
+											type?: string;
+											message?: string;
+											data?: {
+												country?: string;
+												language?: string;
+												fact?: string;
+											};
+										};
+										if (output?.type === "confirmation_required") {
+											agent.userState.pendingConfirmation = {
+												type: "save_context",
+												data: output.data || {},
+												message:
+													output.message ||
+													"Would you like me to remember this?",
+											};
+											agent.saveUserState();
+											pendingConfirmation = {
+												message:
+													output.message ||
+													"Would you like me to remember this?",
+												data: output.data || {},
+											};
+										}
+									}
+								}
 							}
 						},
 					});
@@ -601,57 +736,6 @@ export class EGDataAgent extends DurableObject<Env> {
 					let fullText = "";
 					for await (const chunk of result.textStream) {
 						fullText += chunk;
-					}
-
-				// Extract entities and check for confirmations from tool results
-					let pendingConfirmation: { message: string; data: { country?: string; language?: string; fact?: string } } | undefined;
-					try {
-						const steps = await result.steps;
-						for (const step of steps) {
-							const stepObj = step as unknown as Record<string, unknown>;
-							const stepToolResults = stepObj.toolResults as unknown[] | undefined;
-
-							if (stepToolResults) {
-								for (const tr of stepToolResults) {
-									const typedResult = tr as {
-										toolName?: string;
-										result?: unknown;
-										output?: {
-											type?: string;
-											message?: string;
-											data?: { country?: string; language?: string; fact?: string };
-										};
-									};
-
-									// Extract entities from tool results (for follow-up context)
-									if (typedResult.toolName && typedResult.result) {
-										agent.extractAndSaveEntities(sessionId, typedResult.toolName, typedResult.result);
-									}
-
-									// Check for confirmation requests
-									if (
-										typedResult.toolName === "propose_save_context" &&
-										typedResult.output &&
-										typedResult.output.type === "confirmation_required"
-									) {
-										const confirmOutput = typedResult.output;
-										agent.state.pendingConfirmation = {
-											type: "save_context",
-											data: confirmOutput.data || {},
-											message: confirmOutput.message || "Would you like me to remember this?",
-										};
-										agent.saveState();
-										pendingConfirmation = {
-											message: confirmOutput.message || "Would you like me to remember this?",
-											data: confirmOutput.data || {},
-										};
-										console.log("Found confirmation request:", confirmOutput);
-									}
-								}
-							}
-						}
-					} catch (e) {
-						console.error("Error reading tool results:", e);
 					}
 
 					// Send confirmation event if we have one
@@ -667,10 +751,14 @@ export class EGDataAgent extends DurableObject<Env> {
 						);
 					}
 
+					// Send complete event
 					controller.enqueue(
-						encoder.encode(`data: ${JSON.stringify({ type: "complete", text: fullText })}\n\n`)
+						encoder.encode(
+							`data: ${JSON.stringify({ type: "complete", text: fullText })}\n\n`
+						)
 					);
 
+					// Save assistant response
 					if (fullText.trim()) {
 						agent.addMessage(sessionId, "assistant", fullText);
 					}
@@ -679,7 +767,11 @@ export class EGDataAgent extends DurableObject<Env> {
 				} catch (error) {
 					controller.enqueue(
 						encoder.encode(
-							`data: ${JSON.stringify({ type: "error", message: error instanceof Error ? error.message : "Unknown error" })}\n\n`
+							`data: ${JSON.stringify({
+								type: "error",
+								message:
+									error instanceof Error ? error.message : "Unknown error",
+							})}\n\n`
 						)
 					);
 					controller.close();
@@ -698,41 +790,44 @@ export class EGDataAgent extends DurableObject<Env> {
 
 	// Handle non-streaming chat
 	private async handleChat(request: Request): Promise<Response> {
-		const body = (await request.json()) as { message: string; userId?: string; sessionId?: string };
+		const body = (await request.json()) as {
+			message: string;
+			sessionId?: string;
+			userId?: string;
+		};
 
 		if (!body.message) {
 			return Response.json({ error: "Message is required" }, { status: 400 });
 		}
 
-		// Session ID for conversation-level isolation
 		const sessionId = body.sessionId || "default";
 
-		if (body.userId && !this.state.userId) {
-			this.state.userId = body.userId;
-			this.saveState();
-		}
-
-		const history = this.getConversationHistory(sessionId);
-		this.addMessage(sessionId, "user", body.message);
-
+		// Build system prompt with user context and entity context
 		const entityContext = this.buildEntityContext(sessionId);
-		const systemPrompt = getSystemPrompt(this.state) + entityContext;
+		const systemPrompt = getSystemPrompt(this.userState) + entityContext;
 
-		const messages = [
-			...history.map((m) => ({ role: m.role, content: m.content })),
-			{ role: "user" as const, content: body.message },
-		];
-
+		// All tools including the propose_save_context tool
 		const allTools = {
 			...egdataTools,
 			propose_save_context: proposeSaveContextTool,
 		};
 
+		// Get conversation history and add user message
+		const history = this.getConversationHistory(sessionId);
+		this.addMessage(sessionId, "user", body.message);
+
+		// Convert to model messages format
+		const modelMessages = [
+			...history.map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
+			{ role: "user" as const, content: body.message },
+		];
+
 		try {
+			const { generateText } = await import("ai");
 			const result = await generateText({
 				model: mistral("mistral-small-latest"),
 				system: systemPrompt,
-				messages,
+				messages: modelMessages,
 				tools: allTools,
 				stopWhen: stepCountIs(10),
 			});
@@ -742,13 +837,17 @@ export class EGDataAgent extends DurableObject<Env> {
 			// Extract entities from tool results
 			for (const step of result.steps) {
 				if (step.toolResults) {
-					for (const toolResult of step.toolResults) {
-						const tr = toolResult as { toolName: string; result?: unknown };
-						this.extractAndSaveEntities(sessionId, tr.toolName, tr.result);
+					for (const tr of step.toolResults) {
+						this.extractAndSaveEntities(
+							sessionId,
+							tr.toolName,
+							tr.output
+						);
 					}
 				}
 			}
 
+			// Save assistant response
 			if (responseText.trim()) {
 				this.addMessage(sessionId, "assistant", responseText);
 			}
@@ -758,35 +857,36 @@ export class EGDataAgent extends DurableObject<Env> {
 			});
 		} catch (error) {
 			console.error("Chat error:", error);
-			return Response.json({ error: error instanceof Error ? error.message : "Unknown error" }, { status: 500 });
+			return Response.json(
+				{ error: error instanceof Error ? error.message : "Unknown error" },
+				{ status: 500 }
+			);
 		}
 	}
 
 	// Handle confirmation of pending save
-	private async handleConfirm(request: Request): Promise<Response> {
-		const pending = this.state.pendingConfirmation;
+	private handleConfirm(): Response {
+		const pending = this.userState.pendingConfirmation;
 
 		if (!pending || pending.type !== "save_context") {
 			return Response.json({ error: "No pending confirmation" }, { status: 400 });
 		}
 
 		const { country, language, fact } = pending.data;
-		const newState = { ...this.state, pendingConfirmation: undefined };
 
-		if (country) newState.country = country;
-		if (language) newState.language = language;
+		if (country) this.userState.country = country;
+		if (language) this.userState.language = language;
 		if (fact) {
-			newState.facts = [...this.state.facts];
-			if (!newState.facts.includes(fact)) {
-				newState.facts.push(fact);
-				if (newState.facts.length > 10) {
-					newState.facts = newState.facts.slice(-10);
+			if (!this.userState.facts.includes(fact)) {
+				this.userState.facts.push(fact);
+				if (this.userState.facts.length > 10) {
+					this.userState.facts = this.userState.facts.slice(-10);
 				}
 			}
 		}
 
-		this.state = newState;
-		this.saveState();
+		this.userState.pendingConfirmation = undefined;
+		this.saveUserState();
 
 		return Response.json({
 			success: true,
@@ -797,8 +897,8 @@ export class EGDataAgent extends DurableObject<Env> {
 
 	// Handle rejection of pending save
 	private handleReject(): Response {
-		this.state.pendingConfirmation = undefined;
-		this.saveState();
+		this.userState.pendingConfirmation = undefined;
+		this.saveUserState();
 		return Response.json({
 			success: true,
 			message: "No problem, I won't save that.",
@@ -807,10 +907,11 @@ export class EGDataAgent extends DurableObject<Env> {
 
 	// Handle clearing conversation (only clears session-level context, not user preferences)
 	private handleClear(sessionId: string): Response {
-		// Only clear messages and entities for this specific session
-		this.sql.exec("DELETE FROM messages WHERE session_id = ?", sessionId);
-		this.sql.exec("DELETE FROM known_entities WHERE session_id = ?", sessionId);
-		// User-level context (country, language, facts) is preserved
+		// Clear messages for this session
+		this.sql.exec(`DELETE FROM messages WHERE session_id = ?`, sessionId);
+		// Clear known entities for this session
+		this.sql.exec(`DELETE FROM known_entities WHERE session_id = ?`, sessionId);
 		return Response.json({ success: true });
 	}
 }
+
