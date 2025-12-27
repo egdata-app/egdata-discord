@@ -78,10 +78,14 @@ async function handleCommand(interaction: ChatInputCommandInteraction) {
     logger.error(`Error executing command ${interaction.commandName}:`, error);
     const errorMessage = 'There was an error while executing this command!';
 
-    if (interaction.replied || interaction.deferred) {
-      await interaction.followUp({ content: errorMessage, ephemeral: true });
-    } else {
-      await interaction.reply({ content: errorMessage, ephemeral: true });
+    try {
+      if (interaction.replied || interaction.deferred) {
+        await interaction.followUp({ content: errorMessage, ephemeral: true });
+      } else {
+        await interaction.reply({ content: errorMessage, ephemeral: true });
+      }
+    } catch (replyError) {
+      logger.error(`Failed to send error response for ${interaction.commandName}:`, replyError);
     }
   }
 }
@@ -137,12 +141,14 @@ async function processEpicGamesUrl(message: string) {
       if (slug) {
         consola.info('Product slug:', slug);
 
-        await apiClient.put<{ message: string }>(`/offers/regen/${slug}`).catch((error) => {
-          console.error('Request failed:', error);
-          throw error;
+        const result = await apiClient.put<{ message: string }>(`/offers/regen/${slug}`).catch((error) => {
+          logger.error('Request failed:', error);
+          return null;
         });
 
-        return slug;
+        if (result) {
+          return slug;
+        }
       }
     }
   }
@@ -150,55 +156,67 @@ async function processEpicGamesUrl(message: string) {
 }
 
 client.on(Events.MessageCreate, async (message) => {
-  consola.trace('Message created:', message.content);
-  // Check if the message mentions the bot
-  if (message.mentions.has(client.user!)) {
-    consola.debug('Regenerate command received:', message);
-    if (message.reference) {
-      const originalMessage = await message.channel.messages.fetch(message.reference.messageId as string);
-      const slug = await processEpicGamesUrl(originalMessage.content);
-      if (slug) {
-        await message.reply({
-          content: `🚀 Received request to regenerate offer for slug ${inlineCode(slug)}`,
-        });
+  try {
+    consola.trace('Message created:', message.content);
+    // Check if the message mentions the bot
+    if (message.mentions.has(client.user!)) {
+      consola.debug('Regenerate command received:', message);
+      if (message.reference) {
+        const originalMessage = await message.channel.messages.fetch(message.reference.messageId as string);
+        const slug = await processEpicGamesUrl(originalMessage.content);
+        if (slug) {
+          await message.reply({
+            content: `🚀 Received request to regenerate offer for slug ${inlineCode(slug)}`,
+          });
+        }
       }
     }
+  } catch (error) {
+    logger.error('Error handling message:', error);
   }
 });
 
 client.on(Events.MessageReactionAdd, async (reaction, user) => {
-  // Handle partial reactions
-  if (reaction.partial) {
-    try {
+  try {
+    // Handle partial reactions
+    if (reaction.partial) {
       await reaction.fetch();
-    } catch (error) {
-      logger.error('Error fetching reaction:', error);
-      return;
     }
+
+    logger.info('Reaction added:', {
+      emoji: reaction.emoji.name,
+      userId: user.id,
+      messageId: reaction.message.id
+    });
+
+    // If someone adds a reaction with the emoji `<:EGData:1263952305485779106>`, do the same as the reply in the message
+    if (reaction.emoji.name === 'EGData') {
+      const message = await reaction.message.fetch();
+
+      // Check if the message already has a checkmark reaction
+      const checkmarkReaction = message.reactions.cache.find(r => r.emoji.name === '✅');
+      if (checkmarkReaction) {
+        logger.info('Message already has a checkmark reaction, skipping regeneration');
+        return;
+      }
+
+      const slug = await processEpicGamesUrl(message.content);
+      if (slug) {
+        await message.react('✅');
+      }
+    }
+  } catch (error) {
+    logger.error('Error handling reaction:', error);
   }
+});
 
-  logger.info('Reaction added:', {
-    emoji: reaction.emoji.name,
-    userId: user.id,
-    messageId: reaction.message.id
-  });
+// Global error handlers to prevent crashes
+process.on('uncaughtException', (error) => {
+  logger.error('Uncaught Exception:', error);
+});
 
-  // If someone adds a reaction with the emoji `<:EGData:1263952305485779106>`, do the same as the reply in the message
-  if (reaction.emoji.name === 'EGData') {
-    const message = await reaction.message.fetch();
-
-    // Check if the message already has a checkmark reaction
-    const checkmarkReaction = message.reactions.cache.find(r => r.emoji.name === '✅');
-    if (checkmarkReaction) {
-      logger.info('Message already has a checkmark reaction, skipping regeneration');
-      return;
-    }
-
-    const slug = await processEpicGamesUrl(message.content);
-    if (slug) {
-      await message.react('✅');
-    }
-  }
+process.on('unhandledRejection', (reason, promise) => {
+  logger.error('Unhandled Rejection at:', promise, 'reason:', reason);
 });
 
 // Graceful shutdown

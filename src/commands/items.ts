@@ -105,7 +105,7 @@ export class ItemsCommand extends BaseCommand {
     const data = await this.search(
       query.toString(),
       type?.value?.toString() ?? undefined
-    );
+    ).catch(() => null);
 
     if (!data) {
       await interaction.respond([]);

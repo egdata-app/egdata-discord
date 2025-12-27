@@ -106,7 +106,7 @@ export class GeolockCommand extends BaseCommand {
 
     this.logger.info('Autocomplete query:', query);
 
-    const data = await this.search(query.toString());
+    const data = await this.search(query.toString()).catch(() => null);
 
     if (!data) {
       await interaction.respond([]);
