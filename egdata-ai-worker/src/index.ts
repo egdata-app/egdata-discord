@@ -1,30 +1,44 @@
-import { fromHono } from "chanfana";
-import { Hono } from "hono";
-import { AIChat } from "./endpoints/aiChat";
-import { AIChatStream } from "./endpoints/aiChatStream";
+import { EGDataAgent } from "./agent";
 
-// Start a Hono app
-const app = new Hono<{ Bindings: Env }>();
+// Export the agent class for Durable Objects
+export { EGDataAgent };
 
-// Setup OpenAPI registry
-const openapi = fromHono(app, {
-	docs_url: "/",
-	schema: {
-		info: {
-			title: "EGData AI API",
-			version: "1.0.0",
-			description:
-				"AI-powered assistant for Epic Games Store data. Chat with the AI to get information about games, prices, deals, free games, and more.",
-		},
+export default {
+	async fetch(request: Request, env: Env): Promise<Response> {
+		const url = new URL(request.url);
+
+		// Health check at root level
+		if (url.pathname === "/health") {
+			return Response.json({ status: "ok" });
+		}
+
+		// Extract session ID from request to route to correct agent instance
+		// Session ID format: discord-{userId}-v{version}
+		let agentId = "default";
+
+		if (request.method === "POST") {
+			try {
+				// Clone request to read body without consuming it
+				const clonedRequest = request.clone();
+				const body = (await clonedRequest.json()) as { sessionId?: string; userId?: string };
+
+				if (body.sessionId) {
+					// Extract user ID from session ID
+					const match = body.sessionId.match(/^discord-(\d+)/);
+					agentId = match ? match[1] : body.sessionId;
+				} else if (body.userId) {
+					agentId = body.userId;
+				}
+			} catch {
+				// If we can't parse the body, use default
+			}
+		}
+
+		// Get the Durable Object instance for this user
+		const id = env.EGDATA_AGENT.idFromName(agentId);
+		const stub = env.EGDATA_AGENT.get(id);
+
+		// Forward the request to the agent
+		return stub.fetch(request);
 	},
-});
-
-// Register AI chat endpoints
-openapi.post("/api/chat", AIChat);
-openapi.post("/api/chat/stream", AIChatStream);
-
-// Health check endpoint
-app.get("/health", (c) => c.json({ status: "ok" }));
-
-// Export the Hono app
-export default app;
+};

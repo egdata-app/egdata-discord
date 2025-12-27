@@ -53,7 +53,11 @@ Commands live in `src/commands/` and extend `BaseCommand` (src/types/BaseCommand
 
 Commands are dynamically loaded at startup and stored in `client.commands` Collection.
 
-Current commands: ping, offer, freebies, assets, regenerate, items, seller, geolocks
+Current commands: ping, offer, freebies, assets, regenerate, items, seller, geolocks, ask, clear-chat
+
+**AI Commands:**
+- `ask` - Ask EGData AI questions about games, prices, deals (uses AI worker)
+- `clear-chat` - Reset AI conversation history for a fresh start
 
 ### Event Handlers (in index.ts)
 - `InteractionCreate` - Routes slash commands and autocomplete
@@ -79,41 +83,47 @@ HTTP server on port 3000 (configurable) exposes `/health` endpoint for container
 
 ### Cloudflare Worker (`egdata-ai-worker/`)
 
-AI-powered assistant built with [Hono](https://hono.dev/), [chanfana](https://chanfana.pages.dev/), Workers AI, and [@cloudflare/ai-utils](https://www.npmjs.com/package/@cloudflare/ai-utils).
+AI-powered assistant built with [Vercel AI SDK](https://sdk.vercel.ai/) and [Mistral AI](https://mistral.ai/).
+
+**Architecture:**
+- Vercel AI SDK v6 with `streamText` for streaming responses
+- Mistral SDK (`@ai-sdk/mistral`) with `mistral-small-latest` model for function calling
+- In-memory conversation history (per session, resets on cold starts)
 
 **Structure:**
-- `src/index.ts` - Main router, registers OpenAPI endpoints
-- `src/endpoints/aiChat.ts` - AI chat endpoint with tool execution
-- `src/tools.ts` - AI tool definitions and execution handlers for EGData API
+- `src/index.ts` - Entry point with chat and health endpoints
+- `src/tools.ts` - AI tool definitions with Zod schemas (AI SDK v6 format)
 - `src/types.ts` - TypeScript types
-- `wrangler.jsonc` - Cloudflare Worker configuration with AI binding
+- `wrangler.jsonc` - Cloudflare Worker config
 
 **API Endpoints:**
 - `POST /api/chat` - Chat with the AI assistant
+  - Body: `{ message: string, sessionId?: string, country?: string }`
+  - Returns streaming text response
+- `POST /api/clear` - Clear conversation history for a session
+  - Body: `{ sessionId?: string }`
 - `GET /health` - Health check endpoint
 
-**AI Tools (30+ tools for EGData API):**
-- `search_offers` - Search games using OpenSearch (v2 endpoint)
+**AI Tools (20 tools for EGData API):**
+- `search_offers` - Search games using OpenSearch (POST /search/v2/search)
 - `get_offer_details` - Get full game details
 - `get_offer_price` / `get_offer_price_history` - Current and historical pricing
-- `get_free_games` / `get_free_games_history` - Current and past giveaways
+- `get_free_games` / `get_free_games_history` / `get_free_games_stats` - Giveaway data
 - `get_top_sellers` / `get_top_wishlisted` - Top charts
 - `get_featured_discounts` - Current deals
 - `get_upcoming_games` / `get_latest_releases` - Release info
-- `get_seller_info` / `search_sellers` - Publisher/developer info
-- `get_promotions` / `get_promotion_offers` - Sales and events
-- `get_store_stats` / `get_homepage_stats` - Store statistics
-- `get_collection` - Collection data (top-sellers, etc.)
-- `get_offer_achievements` / `get_offer_reviews` / `get_offer_hltb` - Game metadata
-- `get_sandbox_info` / `get_sandbox_items` - Sandbox (namespace) data
-- `search_items` / `get_item_details` - DLC and item search
+- `search_sellers` - Publisher/developer search
+- `get_promotions` - Sales and events
+- `get_store_stats` - Store statistics
+- `get_offer_achievements` / `get_offer_reviews_summary` / `get_offer_hltb` - Game metadata
+- `get_offer_related` - Related games/DLCs
+- `search_items` - DLC and item search
 
 **Features:**
-- Auto-generated OpenAPI schema at `/`
-- Swagger UI for API exploration
-- Request validation via Zod schemas
-- Workers AI with Llama 3.3 70B model
-- Tool calling with automatic execution
+- Stateful conversations with session persistence via Durable Objects
+- WebSocket streaming for real-time responses
+- Tool calling with automatic execution (up to 10 roundtrips)
+- Conversation history maintained across messages
 
 ## Adding a New Command
 
@@ -137,32 +147,32 @@ export default class YourCommand extends BaseCommand {
 
 ## Adding an AI Tool
 
-1. Add the tool definition to `egdata-ai-worker/src/tools.ts` in the `tools` array:
+Add the tool to `egdata-ai-worker/src/tools.ts` in the `egdataTools` object using AI SDK v6 format with the `tool()` wrapper:
+
 ```typescript
-{
-  name: "your_tool_name",
+import { tool } from "ai";
+
+your_tool_name: tool({
   description: "Description of what the tool does - be specific for the AI",
-  parameters: {
-    type: "object" as const,
-    properties: {
-      param1: {
-        type: "string",
-        description: "Parameter description",
-      },
-    },
-    required: ["param1"],
-  },
-},
+  inputSchema: z.object({
+    param1: z.string().describe("Parameter description"),
+    param2: z.string().optional().describe("Optional parameter"),
+  }),
+  execute: async ({ param1, param2 }, _options) =>
+    apiRequest(`/your-endpoint/${param1}`, { param2: param2 || "" }),
+}),
 ```
 
-2. Add the execution handler in the `executeTool` switch statement:
-```typescript
-case "your_tool_name":
-  return apiRequest(`/your-endpoint/${args.param1}`);
-```
+Key points:
+- Wrap tools with `tool()` from the `ai` package
+- Use `inputSchema` with Zod schemas (not `parameters`)
+- `execute` receives `(args, options)` - the second parameter has `abortSignal`
+- Tools return objects (not strings) - use `apiRequest` helper or return JSON
+- `description` helps the AI understand when to use the tool
 
 ## Environment Variables
 
+### Discord Bot
 Required:
 - `DISCORD_TOKEN` - Bot token
 - `DISCORD_CLIENT_ID` - Application client ID
@@ -170,6 +180,11 @@ Required:
 
 Optional:
 - `HEALTH_CHECK_PORT` - Default 3000
+- `AI_WORKER_URL` - URL of the AI worker (default: `http://localhost:8787`)
+
+### Cloudflare Worker (secrets)
+Set via `wrangler secret put <NAME>` in the `egdata-ai-worker/` directory:
+- `MISTRAL_API_KEY` - Mistral AI API key (required for AI functionality)
 
 ## Conventions
 

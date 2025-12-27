@@ -1,7 +1,215 @@
+import { tool } from "ai";
+import { z } from "zod";
+
 const API_BASE = "https://api.egdata.app";
 
-// Helper to make API requests - returns stringified JSON for AI consumption
-async function apiRequest(path: string, params?: Record<string, string>): Promise<string> {
+// Helper type for tool options
+type ToolOptions = { abortSignal?: AbortSignal };
+
+// Max size for tool results to avoid token limits
+const MAX_RESULT_LENGTH = 15000;
+
+// Filter out pre-purchase offers from arrays
+function filterPrePurchase(arr: unknown[]): unknown[] {
+	return arr.filter((item) => {
+		if (typeof item === "object" && item !== null) {
+			const record = item as Record<string, unknown>;
+			// Keep items where prePurchase is null, undefined, or false
+			return record.prePurchase !== true;
+		}
+		return true;
+	});
+}
+
+// Truncate large objects to reduce token usage and filter pre-purchase offers
+function truncateResult(obj: unknown): unknown {
+	// First, filter pre-purchase offers from any arrays
+	let filtered = obj;
+	if (Array.isArray(obj)) {
+		filtered = filterPrePurchase(obj);
+	} else if (typeof obj === "object" && obj !== null) {
+		const record = obj as Record<string, unknown>;
+		if (Array.isArray(record.elements)) {
+			filtered = { ...record, elements: filterPrePurchase(record.elements) };
+		} else if (Array.isArray(record.hits)) {
+			filtered = { ...record, hits: filterPrePurchase(record.hits) };
+		} else if (Array.isArray(record.offers)) {
+			filtered = { ...record, offers: filterPrePurchase(record.offers) };
+		}
+	}
+
+	const json = JSON.stringify(filtered);
+	if (json.length <= MAX_RESULT_LENGTH) {
+		return filtered;
+	}
+
+	// If it's an array, take fewer items
+	if (Array.isArray(filtered)) {
+		const limited = filtered.slice(0, 5).map((item) => simplifyItem(item));
+		return {
+			items: limited,
+			_truncated: true,
+			_originalCount: filtered.length,
+			_message: `Showing 5 of ${filtered.length} results. Ask for specific details if needed.`,
+		};
+	}
+
+	// If it has an 'elements', 'hits', or 'offers' array (common in search results)
+	if (typeof filtered === "object" && filtered !== null && !Array.isArray(filtered)) {
+		const record = filtered as Record<string, unknown>;
+		if (Array.isArray(record.elements)) {
+			const items = record.elements as unknown[];
+			return {
+				...record,
+				elements: items.slice(0, 5).map((item) => simplifyItem(item)),
+				_truncated: true,
+				_message: `Showing 5 of ${items.length} results.`,
+			};
+		}
+		if (Array.isArray(record.hits)) {
+			const items = record.hits as unknown[];
+			return {
+				...record,
+				hits: items.slice(0, 5).map((item) => simplifyItem(item)),
+				_truncated: true,
+				_message: `Showing 5 of ${items.length} results.`,
+			};
+		}
+		if (Array.isArray(record.offers)) {
+			const items = record.offers as unknown[];
+			return {
+				...record,
+				offers: items.slice(0, 5).map((item) => simplifyItem(item)),
+				_truncated: true,
+				_message: `Showing 5 of ${items.length} results.`,
+			};
+		}
+		// Single object - simplify it
+		return simplifyItem(filtered);
+	}
+
+	return filtered;
+}
+
+// Convert ISO date strings to Unix timestamps for Discord formatting
+function convertDatesToUnix(obj: unknown): unknown {
+	if (typeof obj === "string") {
+		// Check if it's an ISO date string
+		if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/.test(obj)) {
+			const timestamp = Math.floor(new Date(obj).getTime() / 1000);
+			return { _isoDate: obj, _unixTimestamp: timestamp };
+		}
+		return obj;
+	}
+	if (Array.isArray(obj)) {
+		return obj.map(convertDatesToUnix);
+	}
+	if (typeof obj === "object" && obj !== null) {
+		const result: Record<string, unknown> = {};
+		for (const [key, value] of Object.entries(obj)) {
+			result[key] = convertDatesToUnix(value);
+		}
+		return result;
+	}
+	return obj;
+}
+
+// Simplify an item to only essential fields
+function simplifyItem(item: unknown): unknown {
+	if (typeof item !== "object" || item === null) return item;
+
+	const record = item as Record<string, unknown>;
+	const simplified: Record<string, unknown> = {};
+
+	// Keep only essential fields for games/offers
+	const essentialFields = [
+		"id",
+		"title",
+		"name",
+		"description",
+		"shortDescription",
+		"price",
+		"originalPrice",
+		"discountPrice",
+		"discount",
+		"discountPercentage",
+		"seller",
+		"developer",
+		"publisher",
+		"releaseDate",
+		"effectiveDate",
+		"offerType",
+		"type",
+		"url",
+		"slug",
+		"namespace",
+		"currentPrice",
+		"totalPrice",
+		"fmtPrice",
+		"appliedRules",
+		"startDate",
+		"endDate",
+		"upcoming",
+		"giveaway",
+		"prePurchase", // true = pre-purchase offer (no discounts), null = regular offer
+		"status",
+		"score",
+		"reviewCount",
+		"averageRating",
+		// Tags, genres, and categories
+		"tags",
+		"genres",
+		"categories",
+		"features",
+		// Platform and technical info
+		"platform",
+		"platforms",
+		"downloadSizeBytes",
+		"installedSizeBytes",
+		// Item/asset specific
+		"entitlementType",
+		"itemType",
+		"releaseInfo",
+	];
+
+	for (const field of essentialFields) {
+		if (field in record && record[field] !== null && record[field] !== undefined) {
+			const value = record[field];
+			// For nested objects like price, simplify further
+			if (typeof value === "object" && !Array.isArray(value)) {
+				simplified[field] = simplifyItem(value);
+			} else if (Array.isArray(value)) {
+				// For arrays like tags, extract just the names if objects have name property
+				if (value.length > 0 && typeof value[0] === "object" && value[0] !== null && "name" in value[0]) {
+					simplified[field] = value.map((item: { name: string }) => item.name).slice(0, 15);
+				} else {
+					simplified[field] = value.slice(0, 10); // Limit array size
+				}
+			} else if (typeof value === "string" && value.length > 500) {
+				// Truncate long strings
+				simplified[field] = value.substring(0, 500) + "...";
+			} else {
+				simplified[field] = value;
+			}
+		}
+	}
+
+	// If we got nothing useful, return a subset of original keys
+	if (Object.keys(simplified).length === 0) {
+		const keys = Object.keys(record).slice(0, 10);
+		for (const key of keys) {
+			simplified[key] = record[key];
+		}
+	}
+
+	return simplified;
+}
+
+// Helper to make API requests with truncation and date conversion
+async function apiRequest(
+	path: string,
+	params?: Record<string, string>
+): Promise<unknown> {
 	const url = new URL(`${API_BASE}${path}`);
 	if (params) {
 		for (const [key, value] of Object.entries(params)) {
@@ -12,80 +220,48 @@ async function apiRequest(path: string, params?: Record<string, string>): Promis
 	}
 	const response = await fetch(url.toString());
 	if (!response.ok) {
-		return JSON.stringify({ error: `API request failed: ${response.status} ${response.statusText}` });
+		return {
+			error: `API request failed: ${response.status} ${response.statusText}`,
+		};
 	}
 	const data = await response.json();
-	return JSON.stringify(data);
+	const truncated = truncateResult(data);
+	return convertDatesToUnix(truncated);
 }
 
-// Tool definitions for AI with inline execution functions
-export const tools = [
-	{
-		name: "search_offers",
+// Tool definitions using AI SDK v6 format with tool() wrapper and inputSchema
+export const egdataTools = {
+	search_offers: tool({
 		description:
-			"Search for games, DLCs, bundles, and other offers in the Epic Games Store. Use this to find games by name, filter by type, tags, price range, or sort by various criteria.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				query: {
-					type: "string",
-					description: "Search query for game title",
-				},
-				offerType: {
-					type: "string",
-					description: "Filter by offer type: BASE_GAME, DLC, BUNDLE, ADD_ON, EDITION, etc.",
-				},
-				tags: {
-					type: "string",
-					description: "Comma-separated tag IDs to filter by",
-				},
-				minPrice: {
-					type: "number",
-					description: "Minimum price in cents",
-				},
-				maxPrice: {
-					type: "number",
-					description: "Maximum price in cents",
-				},
-				sortBy: {
-					type: "string",
-					description:
-						"Sort by: releaseDate, lastModifiedDate, effectiveDate, creationDate, viewableDate, pcReleaseDate, upcoming, price, currentPrice, discount",
-				},
-				sortDir: {
-					type: "string",
-					description: "Sort direction: asc or desc",
-				},
-				limit: {
-					type: "number",
-					description: "Number of results (max 50)",
-				},
-				page: {
-					type: "number",
-					description: "Page number for pagination",
-				},
-				country: {
-					type: "string",
-					description: "Country code for regional pricing (e.g., US, GB, DE)",
-				},
-			},
-			required: [] as string[],
-		},
-		function: async (args: Record<string, unknown>): Promise<string> => {
+			"Search for games, DLCs, bundles, and other offers in the Epic Games Store. Use this to find games by name, filter by type, or sort by various criteria.",
+		inputSchema: z.object({
+			query: z.string().optional().describe("Search query for game title"),
+			offerType: z
+				.string()
+				.optional()
+				.describe(
+					"Filter by offer type: BASE_GAME, DLC, BUNDLE, ADD_ON, EDITION"
+				),
+			sortBy: z
+				.string()
+				.optional()
+				.describe("Sort by: releaseDate, lastModifiedDate, price, discount"),
+			sortDir: z.string().optional().describe("Sort direction: asc or desc"),
+			limit: z.number().optional().describe("Number of results (max 10)"),
+			page: z.number().optional().describe("Page number for pagination"),
+			country: z
+				.string()
+				.optional()
+				.describe("Country code for regional pricing (e.g., US, GB, DE)"),
+		}),
+		execute: async (args, _options: ToolOptions) => {
 			const body: Record<string, unknown> = {};
 			if (args.query) body.title = args.query;
 			if (args.offerType) body.offerType = args.offerType;
-			if (args.tags) body.tags = (args.tags as string).split(",");
-			if (args.minPrice !== undefined || args.maxPrice !== undefined) {
-				body.price = {};
-				if (args.minPrice !== undefined)
-					(body.price as Record<string, number>).min = args.minPrice as number;
-				if (args.maxPrice !== undefined)
-					(body.price as Record<string, number>).max = args.maxPrice as number;
-			}
 			if (args.sortBy) body.sortBy = args.sortBy;
 			if (args.sortDir) body.sortDir = args.sortDir;
-			if (args.limit) body.limit = args.limit;
+			// Limit results to avoid token overflow
+			body.limit = Math.min(args.limit || 5, 10);
 			if (args.page) body.page = args.page;
 			if (args.country) body.country = args.country;
 
@@ -95,671 +271,237 @@ export const tools = [
 				body: JSON.stringify(body),
 			});
 			const data = await response.json();
-			return JSON.stringify(data);
+			const truncated = truncateResult(data);
+			return convertDatesToUnix(truncated);
 		},
-	},
-	{
-		name: "get_offer_details",
+	}),
+
+	get_offer_details: tool({
 		description:
-			"Get detailed information about a specific game/offer including description, images, developer, publisher, release date, and more. Use the offer ID from search results.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				offerId: {
-					type: "string",
-					description: "The offer ID to get details for",
-				},
-			},
-			required: ["offerId"],
-		},
-		function: async (args: { offerId: string }) => {
-			return apiRequest(`/offers/${args.offerId}`);
-		},
-	},
-	{
-		name: "get_offer_price",
-		description: "Get current pricing information for a specific offer in a given region.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				offerId: {
-					type: "string",
-					description: "The offer ID to get price for",
-				},
-				country: {
-					type: "string",
-					description: "Country code for regional pricing (default: US)",
-				},
-			},
-			required: ["offerId"],
-		},
-		function: async (args: { offerId: string; country?: string }) => {
-			return apiRequest(`/offers/${args.offerId}/price`, {
-				country: args.country || "US",
-			});
-		},
-	},
-	{
-		name: "get_offer_price_history",
+			"Get detailed information about a specific game/offer including description, images, developer, publisher, release date. Use the offer ID from search results.",
+		inputSchema: z.object({
+			offerId: z.string().describe("The offer ID to get details for"),
+		}),
+		execute: async ({ offerId }, _options: ToolOptions) =>
+			apiRequest(`/offers/${offerId}`),
+	}),
+
+	get_offer_price: tool({
 		description:
-			"Get historical pricing data for a game to see past discounts and price changes over time.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				offerId: {
-					type: "string",
-					description: "The offer ID to get price history for",
-				},
-				country: {
-					type: "string",
-					description: "Country code for regional pricing (default: US)",
-				},
-			},
-			required: ["offerId"],
-		},
-		function: async (args: { offerId: string; country?: string }) => {
-			return apiRequest(`/offers/${args.offerId}/price-history`, {
-				country: args.country || "US",
-			});
-		},
-	},
-	{
-		name: "get_free_games",
+			"Get current pricing information for a specific offer in a given region.",
+		inputSchema: z.object({
+			offerId: z.string().describe("The offer ID to get price for"),
+			country: z
+				.string()
+				.optional()
+				.describe("Country code for regional pricing (default: US)"),
+		}),
+		execute: async ({ offerId, country }, _options: ToolOptions) =>
+			apiRequest(`/offers/${offerId}/price`, { country: country || "US" }),
+	}),
+
+	get_offer_price_history: tool({
 		description:
-			"Get currently free games on Epic Games Store, including both PC and mobile giveaways.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				country: {
-					type: "string",
-					description: "Country code for regional info (default: US)",
-				},
-			},
-			required: [] as string[],
-		},
-		function: async (args: { country?: string }) => {
-			return apiRequest("/free-games", {
-				country: args.country || "US",
-			});
-		},
-	},
-	{
-		name: "get_free_games_history",
+			"Get historical pricing data for a game to see past discounts and price changes.",
+		inputSchema: z.object({
+			offerId: z.string().describe("The offer ID to get price history for"),
+			country: z
+				.string()
+				.optional()
+				.describe("Country code for regional pricing (default: US)"),
+		}),
+		execute: async ({ offerId, country }, _options: ToolOptions) =>
+			apiRequest(`/offers/${offerId}/price-history`, {
+				country: country || "US",
+			}),
+	}),
+
+	get_free_games: tool({
 		description:
-			"Get history of past free game giveaways on Epic Games Store with pagination.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				country: {
-					type: "string",
-					description: "Country code (default: US)",
-				},
-				limit: {
-					type: "number",
-					description: "Results per page (max 25)",
-				},
-				page: {
-					type: "number",
-					description: "Page number",
-				},
-			},
-			required: [] as string[],
-		},
-		function: async (args: { country?: string; limit?: number; page?: number }) => {
-			return apiRequest("/free-games/history", {
-				country: args.country || "US",
-				limit: String(args.limit || 10),
-				page: String(args.page || 1),
-			});
-		},
-	},
-	{
-		name: "get_free_games_stats",
+			"Get currently free games on Epic Games Store, including both PC and mobile giveaways. This is the most important tool for finding what games are currently free.",
+		inputSchema: z.object({
+			country: z
+				.string()
+				.optional()
+				.describe("Country code for regional info (default: US)"),
+		}),
+		execute: async ({ country }, _options: ToolOptions) =>
+			apiRequest("/free-games", { country: country || "US" }),
+	}),
+
+	get_free_games_history: tool({
 		description:
-			"Get aggregated statistics about all Epic Games Store giveaways including total value, count, and seller stats.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				country: {
-					type: "string",
-					description: "Country code (default: US)",
-				},
-			},
-			required: [] as string[],
-		},
-		function: async (args: { country?: string }) => {
-			return apiRequest("/free-games/stats", {
-				country: args.country || "US",
-			});
-		},
-	},
-	{
-		name: "get_top_sellers",
+			"Get history of past free game giveaways on Epic Games Store. Returns paginated results (not a total count). Use this to see recent/past giveaways, but NOT for counting total giveaways per year.",
+		inputSchema: z.object({
+			country: z.string().optional().describe("Country code (default: US)"),
+			limit: z.number().optional().describe("Results per page (max 25)"),
+			page: z.number().optional().describe("Page number"),
+		}),
+		execute: async ({ country, limit, page }, _options: ToolOptions) =>
+			apiRequest("/free-games/history", {
+				country: country || "US",
+				limit: String(limit || 10),
+				page: String(page || 1),
+			}),
+	}),
+
+	get_free_games_stats: tool({
 		description:
-			"Get the current top selling games on Epic Games Store with their ranking positions.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				limit: {
-					type: "number",
-					description: "Number of results (default: 10)",
-				},
-				page: {
-					type: "number",
-					description: "Page number",
-				},
-			},
-			required: [] as string[],
-		},
-		function: async (args: { limit?: number; page?: number }) => {
-			return apiRequest("/offers/top-sellers", {
-				limit: String(args.limit || 10),
-				page: String(args.page || 1),
-			});
-		},
-	},
-	{
-		name: "get_top_wishlisted",
+			"Get ALL-TIME aggregated statistics about Epic Games Store giveaways (since 2018, not filtered by year). Returns total count, total value, and number of unique offers. For year-specific data, use get_free_games_history instead.",
+		inputSchema: z.object({
+			country: z.string().optional().describe("Country code (default: US)"),
+		}),
+		execute: async ({ country }, _options: ToolOptions) =>
+			apiRequest("/free-games/stats", { country: country || "US" }),
+	}),
+
+	get_top_sellers: tool({
+		description:
+			"Get the current top selling games on Epic Games Store with ranking positions.",
+		inputSchema: z.object({
+			limit: z.number().optional().describe("Number of results (default: 10)"),
+			page: z.number().optional().describe("Page number"),
+		}),
+		execute: async ({ limit, page }, _options: ToolOptions) =>
+			apiRequest("/offers/top-sellers", {
+				limit: String(limit || 10),
+				page: String(page || 1),
+			}),
+	}),
+
+	get_top_wishlisted: tool({
 		description: "Get the most wishlisted games on Epic Games Store.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				limit: {
-					type: "number",
-					description: "Number of results (default: 10)",
-				},
-				page: {
-					type: "number",
-					description: "Page number",
-				},
-			},
-			required: [] as string[],
-		},
-		function: async (args: { limit?: number; page?: number }) => {
-			return apiRequest("/offers/top-wishlisted", {
-				limit: String(args.limit || 10),
-				page: String(args.page || 1),
-			});
-		},
-	},
-	{
-		name: "get_featured_discounts",
+		inputSchema: z.object({
+			limit: z.number().optional().describe("Number of results (default: 10)"),
+			page: z.number().optional().describe("Page number"),
+		}),
+		execute: async ({ limit, page }, _options: ToolOptions) =>
+			apiRequest("/offers/top-wishlisted", {
+				limit: String(limit || 10),
+				page: String(page || 1),
+			}),
+	}),
+
+	get_featured_discounts: tool({
 		description: "Get currently featured games with active discounts.",
-		parameters: {
-			type: "object" as const,
-			properties: {},
-			required: [] as string[],
-		},
-		function: async () => {
-			return apiRequest("/offers/featured-discounts");
-		},
-	},
-	{
-		name: "get_upcoming_games",
+		inputSchema: z.object({}),
+		execute: async (_args, _options: ToolOptions) =>
+			apiRequest("/offers/featured-discounts"),
+	}),
+
+	get_upcoming_games: tool({
 		description: "Get upcoming game releases on Epic Games Store.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				limit: {
-					type: "number",
-					description: "Number of results",
-				},
-				page: {
-					type: "number",
-					description: "Page number",
-				},
-			},
-			required: [] as string[],
-		},
-		function: async (args: { limit?: number; page?: number }) => {
-			return apiRequest("/offers/upcoming", {
-				limit: String(args.limit || 10),
-				page: String(args.page || 1),
-			});
-		},
-	},
-	{
-		name: "get_latest_releases",
+		inputSchema: z.object({
+			limit: z.number().optional().describe("Number of results"),
+			page: z.number().optional().describe("Page number"),
+		}),
+		execute: async ({ limit, page }, _options: ToolOptions) =>
+			apiRequest("/offers/upcoming", {
+				limit: String(limit || 10),
+				page: String(page || 1),
+			}),
+	}),
+
+	get_latest_releases: tool({
 		description: "Get the most recently released games on Epic Games Store.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				limit: {
-					type: "number",
-					description: "Number of results",
-				},
-				page: {
-					type: "number",
-					description: "Page number",
-				},
-			},
-			required: [] as string[],
-		},
-		function: async (args: { limit?: number; page?: number }) => {
-			return apiRequest("/offers/latest-released", {
-				limit: String(args.limit || 10),
-				page: String(args.page || 1),
-			});
-		},
-	},
-	{
-		name: "get_seller_info",
-		description:
-			"Get information about a game seller/publisher including their offers and statistics.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				sellerId: {
-					type: "string",
-					description: "The seller ID",
-				},
-				country: {
-					type: "string",
-					description: "Country code for pricing (default: US)",
-				},
-				limit: {
-					type: "number",
-					description: "Number of offers to return",
-				},
-				page: {
-					type: "number",
-					description: "Page number",
-				},
-			},
-			required: ["sellerId"],
-		},
-		function: async (args: { sellerId: string; country?: string; limit?: number; page?: number }) => {
-			return apiRequest(`/sellers/${args.sellerId}`, {
-				country: args.country || "US",
-				limit: String(args.limit || 10),
-				page: String(args.page || 1),
-			});
-		},
-	},
-	{
-		name: "get_seller_stats",
-		description:
-			"Get statistics for a seller including offer count, games count, and free games count.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				sellerId: {
-					type: "string",
-					description: "The seller ID",
-				},
-			},
-			required: ["sellerId"],
-		},
-		function: async (args: { sellerId: string }) => {
-			return apiRequest(`/sellers/${args.sellerId}/stats`);
-		},
-	},
-	{
-		name: "search_sellers",
+		inputSchema: z.object({
+			limit: z.number().optional().describe("Number of results"),
+			page: z.number().optional().describe("Page number"),
+		}),
+		execute: async ({ limit, page }, _options: ToolOptions) =>
+			apiRequest("/offers/latest-released", {
+				limit: String(limit || 10),
+				page: String(page || 1),
+			}),
+	}),
+
+	search_sellers: tool({
 		description: "Search for game sellers/publishers by name.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				query: {
-					type: "string",
-					description: "Search query for seller name",
-				},
-			},
-			required: ["query"],
-		},
-		function: async (args: { query: string }) => {
-			return apiRequest("/multisearch/sellers", {
-				query: args.query,
-			});
-		},
-	},
-	{
-		name: "get_promotions",
+		inputSchema: z.object({
+			query: z.string().describe("Search query for seller name"),
+		}),
+		execute: async ({ query }, _options: ToolOptions) =>
+			apiRequest("/multisearch/sellers", { query }),
+	}),
+
+	get_promotions: tool({
 		description: "Get active promotional events and sales on Epic Games Store.",
-		parameters: {
-			type: "object" as const,
-			properties: {},
-			required: [] as string[],
-		},
-		function: async () => {
-			return apiRequest("/promotions");
-		},
-	},
-	{
-		name: "get_promotion_offers",
-		description: "Get offers associated with a specific promotional event.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				promotionId: {
-					type: "string",
-					description: "The promotion/event ID",
-				},
-				country: {
-					type: "string",
-					description: "Country code for pricing",
-				},
-				limit: {
-					type: "number",
-					description: "Number of results",
-				},
-				page: {
-					type: "number",
-					description: "Page number",
-				},
-				sortBy: {
-					type: "string",
-					description: "Sort field",
-				},
-			},
-			required: ["promotionId"],
-		},
-		function: async (args: { promotionId: string; country?: string; limit?: number; page?: number; sortBy?: string }) => {
-			return apiRequest(`/promotions/${args.promotionId}`, {
-				country: args.country || "US",
-				limit: String(args.limit || 10),
-				page: String(args.page || 1),
-				sortBy: args.sortBy || "lastModifiedDate",
-			});
-		},
-	},
-	{
-		name: "get_store_stats",
+		inputSchema: z.object({}),
+		execute: async (_args, _options: ToolOptions) => apiRequest("/promotions"),
+	}),
+
+	get_store_stats: tool({
 		description:
-			"Get overall Epic Games Store statistics including total offers, items, and historical data.",
-		parameters: {
-			type: "object" as const,
-			properties: {},
-			required: [] as string[],
-		},
-		function: async () => {
-			return apiRequest("/stats");
-		},
-	},
-	{
-		name: "get_homepage_stats",
+			"Get overall Epic Games Store statistics including total offers and items.",
+		inputSchema: z.object({}),
+		execute: async (_args, _options: ToolOptions) => apiRequest("/stats"),
+	}),
+
+	get_offer_achievements: tool({
+		description: "Get achievement information for a game.",
+		inputSchema: z.object({
+			offerId: z.string().describe("The offer ID"),
+		}),
+		execute: async ({ offerId }, _options: ToolOptions) =>
+			apiRequest(`/offers/${offerId}/achievements`),
+	}),
+
+	get_offer_reviews_summary: tool({
 		description:
-			"Get homepage statistics including offer count, price changes, active discounts, and giveaways.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				country: {
-					type: "string",
-					description: "Country code (default: US)",
-				},
-			},
-			required: [] as string[],
-		},
-		function: async (args: { country?: string }) => {
-			return apiRequest("/stats/homepage", {
-				country: args.country || "US",
-			});
-		},
-	},
-	{
-		name: "get_collection",
-		description:
-			"Get offers from a specific collection (e.g., top-sellers, top-wishlisted) with pagination.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				slug: {
-					type: "string",
-					description: "Collection slug (e.g., top-sellers, top-wishlisted)",
-				},
-				country: {
-					type: "string",
-					description: "Country code for pricing",
-				},
-				limit: {
-					type: "number",
-					description: "Number of results",
-				},
-				page: {
-					type: "number",
-					description: "Page number",
-				},
-			},
-			required: ["slug"],
-		},
-		function: async (args: { slug: string; country?: string; limit?: number; page?: number }) => {
-			return apiRequest(`/collections/${args.slug}`, {
-				country: args.country || "US",
-				limit: String(args.limit || 10),
-				page: String(args.page || 1),
-			});
-		},
-	},
-	{
-		name: "get_offer_achievements",
-		description: "Get achievement information for a game including achievement sets and stats.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				offerId: {
-					type: "string",
-					description: "The offer ID",
-				},
-			},
-			required: ["offerId"],
-		},
-		function: async (args: { offerId: string }) => {
-			return apiRequest(`/offers/${args.offerId}/achievements`);
-		},
-	},
-	{
-		name: "get_offer_reviews",
-		description: "Get user reviews for a game with ratings and recommendation data.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				offerId: {
-					type: "string",
-					description: "The offer ID",
-				},
-				limit: {
-					type: "number",
-					description: "Number of reviews to return",
-				},
-				page: {
-					type: "number",
-					description: "Page number",
-				},
-			},
-			required: ["offerId"],
-		},
-		function: async (args: { offerId: string; limit?: number; page?: number }) => {
-			return apiRequest(`/offers/${args.offerId}/reviews`, {
-				limit: String(args.limit || 10),
-				page: String(args.page || 1),
-			});
-		},
-	},
-	{
-		name: "get_offer_reviews_summary",
-		description:
-			"Get aggregated review statistics for a game including average score and recommendation percentage.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				offerId: {
-					type: "string",
-					description: "The offer ID",
-				},
-			},
-			required: ["offerId"],
-		},
-		function: async (args: { offerId: string }) => {
-			return apiRequest(`/offers/${args.offerId}/reviews-summary`);
-		},
-	},
-	{
-		name: "get_offer_hltb",
+			"Get aggregated review statistics for a game including average score.",
+		inputSchema: z.object({
+			offerId: z.string().describe("The offer ID"),
+		}),
+		execute: async ({ offerId }, _options: ToolOptions) =>
+			apiRequest(`/offers/${offerId}/reviews-summary`),
+	}),
+
+	get_offer_hltb: tool({
 		description: "Get HowLongToBeat data for a game showing expected playtime.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				offerId: {
-					type: "string",
-					description: "The offer ID",
-				},
-			},
-			required: ["offerId"],
-		},
-		function: async (args: { offerId: string }) => {
-			return apiRequest(`/offers/${args.offerId}/hltb`);
-		},
-	},
-	{
-		name: "get_genres",
-		description: "Get all available genres with sample games for each.",
-		parameters: {
-			type: "object" as const,
-			properties: {},
-			required: [] as string[],
-		},
-		function: async () => {
-			return apiRequest("/offers/genres");
-		},
-	},
-	{
-		name: "get_events",
-		description: "Get active event tags with associated games.",
-		parameters: {
-			type: "object" as const,
-			properties: {},
-			required: [] as string[],
-		},
-		function: async () => {
-			return apiRequest("/offers/events");
-		},
-	},
-	{
-		name: "get_sandbox_info",
+		inputSchema: z.object({
+			offerId: z.string().describe("The offer ID"),
+		}),
+		execute: async ({ offerId }, _options: ToolOptions) =>
+			apiRequest(`/offers/${offerId}/hltb`),
+	}),
+
+	get_offer_related: tool({
 		description:
-			"Get information about a game sandbox including items, offers, and builds. A sandbox is Epic's container for a game's content.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				sandboxId: {
-					type: "string",
-					description: "The sandbox ID (namespace)",
-				},
-			},
-			required: ["sandboxId"],
-		},
-		function: async (args: { sandboxId: string }) => {
-			return apiRequest(`/sandboxes/${args.sandboxId}`);
-		},
-	},
-	{
-		name: "get_sandbox_items",
-		description: "Get items (DLC, add-ons, entitlements) within a game sandbox.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				sandboxId: {
-					type: "string",
-					description: "The sandbox ID",
-				},
-				limit: {
-					type: "number",
-					description: "Number of results",
-				},
-				page: {
-					type: "number",
-					description: "Page number",
-				},
-			},
-			required: ["sandboxId"],
-		},
-		function: async (args: { sandboxId: string; limit?: number; page?: number }) => {
-			return apiRequest(`/sandboxes/${args.sandboxId}/items`, {
-				limit: String(args.limit || 10),
-				page: String(args.page || 1),
-			});
-		},
-	},
-	{
-		name: "get_offer_related",
-		description: "Get related offers/games from the same namespace or franchise.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				offerId: {
-					type: "string",
-					description: "The offer ID",
-				},
-			},
-			required: ["offerId"],
-		},
-		function: async (args: { offerId: string }) => {
-			return apiRequest(`/offers/${args.offerId}/related`);
-		},
-	},
-	{
-		name: "get_offer_dlc",
-		description: "Get DLC and add-on content available for a base game.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				offerId: {
-					type: "string",
-					description: "The offer ID of the base game",
-				},
-				country: {
-					type: "string",
-					description: "Country code for pricing",
-				},
-			},
-			required: ["offerId"],
-		},
-		function: async (args: { offerId: string; country?: string }) => {
-			return apiRequest(`/offers/${args.offerId}/items`, {
-				country: args.country || "US",
-			});
-		},
-	},
-	{
-		name: "get_item_details",
+			"Get related offers/games from the same namespace or franchise.",
+		inputSchema: z.object({
+			offerId: z.string().describe("The offer ID"),
+		}),
+		execute: async ({ offerId }, _options: ToolOptions) =>
+			apiRequest(`/offers/${offerId}/related`),
+	}),
+
+	search_items: tool({
 		description:
-			"Get detailed information about a specific item (DLC, entitlement, add-on).",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				itemId: {
-					type: "string",
-					description: "The item ID",
-				},
-			},
-			required: ["itemId"],
-		},
-		function: async (args: { itemId: string }) => {
-			return apiRequest(`/items/${args.itemId}`);
-		},
-	},
-	{
-		name: "search_items",
-		description: "Search for items (DLCs, add-ons, entitlements) in the Epic Games Store.",
-		parameters: {
-			type: "object" as const,
-			properties: {
-				query: {
-					type: "string",
-					description: "Search query",
-				},
-				type: {
-					type: "string",
-					description: "Entitlement type filter",
-				},
-			},
-			required: ["query"],
-		},
-		function: async (args: { query: string; type?: string }) => {
-			return apiRequest("/multisearch/items", {
-				query: args.query,
-				type: args.type || "",
-			});
-		},
-	},
-];
+			"Search for items (executables/entitlements) in the Epic Games Store. Items are what you actually download and run - the launcher entries. Use this to find specific executables, not game store listings (use search_offers for that). Items do NOT contain download size info.",
+		inputSchema: z.object({
+			query: z.string().describe("Search query for item/executable name"),
+		}),
+		execute: async ({ query }, _options: ToolOptions) =>
+			apiRequest("/multisearch/items", { query }),
+	}),
+
+	get_offer_items: tool({
+		description:
+			"Get all items (executables/entitlements) associated with an offer. Use this to find the downloadable content for a game. Returns item IDs that can be used with get_item_assets to find download sizes.",
+		inputSchema: z.object({
+			offerId: z.string().describe("The offer ID to get items for"),
+		}),
+		execute: async ({ offerId }, _options: ToolOptions) =>
+			apiRequest(`/offers/${offerId}/items`),
+	}),
+
+	get_item_assets: tool({
+		description:
+			"Get asset/build information for an item, including download size and installed size per platform. This is the ONLY way to get game download sizes. Returns downloadSizeBytes and installedSizeBytes for each platform (Windows, Mac, etc.).",
+		inputSchema: z.object({
+			itemId: z.string().describe("The item ID to get assets for"),
+		}),
+		execute: async ({ itemId }, _options: ToolOptions) =>
+			apiRequest(`/items/${itemId}/assets`),
+	}),
+};

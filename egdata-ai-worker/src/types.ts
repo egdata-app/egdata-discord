@@ -1,3 +1,4 @@
-import type { Context } from "hono";
+// Types are auto-generated in worker-configuration.d.ts
+// This file is kept for any custom type definitions
 
-export type AppContext = Context<{ Bindings: Env }>;
+export type SessionId = string;
