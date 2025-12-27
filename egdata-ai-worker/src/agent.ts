@@ -32,7 +32,9 @@ interface ChatMessage {
 const TOOL_DESCRIPTIONS: Record<string, string> = {
 	search_offers: "Searching for games...",
 	get_offer_details: "Getting game details...",
+	get_offers_details: "Getting details for multiple games...",
 	get_offer_price: "Checking current price...",
+	get_offer_prices: "Fetching prices for multiple games...",
 	get_offer_price_history: "Fetching price history...",
 	get_free_games: "Finding free games...",
 	get_free_games_history: "Loading giveaway history...",
@@ -51,7 +53,9 @@ const TOOL_DESCRIPTIONS: Record<string, string> = {
 	get_offer_related: "Finding related games...",
 	search_items: "Searching executables/entitlements...",
 	get_offer_items: "Getting downloadable items...",
+	get_offers_items: "Getting items for multiple games...",
 	get_item_assets: "Checking download size...",
+	get_items_assets: "Checking download sizes for multiple games...",
 	propose_save_context: "Preparing to remember...",
 };
 
@@ -121,16 +125,25 @@ IMPORTANT for download sizes:
 - **SANITY CHECK**: No single game exceeds 300 GB. If you see >300 GB, you picked the wrong item. Try a different item.
 
 ## Your tools
+**Single item tools:**
 - search_offers: Find games by name (returns offer IDs)
 - get_offer_details: Get game info (needs offer ID)
 - get_offer_price: Current price (needs offer ID)
 - get_offer_price_history: Historical prices (needs offer ID)
 - get_offer_items: Get items/executables for an offer (needs offer ID)
-- get_item_assets: Get download/install sizes per platform (needs item ID) - USE THIS FOR SIZE QUESTIONS
+- get_item_assets: Get download/install sizes per platform (needs item ID)
+
+**Bulk tools (use these for comparisons - much more efficient!):**
+- get_offers_details: Get details for MULTIPLE offers in one call
+- get_offer_prices: Get prices for MULTIPLE offers in one call
+- get_offers_items: Get items for MULTIPLE offers in one call
+- get_items_assets: Get assets/sizes for MULTIPLE items in one call
+
+**Other tools:**
 - get_free_games: Current free games (no ID needed)
 - get_free_games_history: Recent past giveaways (PAGINATED - can't count totals per year!)
 - get_free_games_stats: ALL-TIME stats since 2018 (total count & value, NOT year-specific)
-- get_top_sellers, get_top_wishlisted: Charts (no ID needed)
+- get_top_sellers, get_top_wishlisted: Charts (no ID needed, NO price data - use get_offer_prices after!)
 - get_offer_achievements, get_offer_reviews_summary, get_offer_hltb: Game metadata (needs offer ID)
 - propose_save_context: Propose saving user info (country, preferences) - user will confirm
 
@@ -198,6 +211,34 @@ Example price response:
   - NEVER infer country from price queries - only save if user explicitly tells you
   - If user just asks for a price and you show it in their local currency, that's fine - don't ask to save
 - **USE PRE-FORMATTED PRICES**: Price tools return \`originalPriceFormatted\`, \`discountPriceFormatted\`, etc. Use these directly - DO NOT do any math on price values.
+
+## CRITICAL: Never Hallucinate Data
+- **get_top_sellers and get_top_wishlisted do NOT include price data** - they only return game titles and IDs
+- To get prices for multiple games, use **get_offer_prices** (plural) with an array of offer IDs
+- **NEVER make up or guess prices** - if you didn't fetch the price, you don't know it
+- Example: "Compare prices of top 5 sellers" requires:
+  1. Call get_top_sellers → get 5 game IDs
+  2. Call get_offer_prices with all 5 IDs in one call
+  3. ONLY then can you show a price table
+
+## Search Results: Look at ALL Results
+- Search results may contain multiple offers for the same game (pre-purchase, regular, editions)
+- **ALWAYS look through ALL results** - don't stop at the first one
+- Look for the offer with \`prePurchase: null\` (the regular offer) - this is the one to use
+- A game EXISTS if ANY result has \`prePurchase: null\`, even if the first result is pre-purchase
+
+## Stay On Topic
+- If a search returns results, USE those results - don't claim the game doesn't exist
+- **NEVER suggest unrelated games** when the user asks about a specific game
+- If you can't find a game, say "I couldn't find [game name] in the Epic Games Store" - don't pivot to free games or other suggestions
+- Only suggest alternatives if the user explicitly asks for recommendations
+
+## Unsupported Queries
+These data types are NOT available - be honest about it:
+- "Most played games" / player counts - NOT AVAILABLE (only have top sellers and wishlisted)
+- Year-specific giveaway counts - NOT AVAILABLE (only have all-time stats)
+- Real-time player numbers - NOT AVAILABLE
+If user asks for unavailable data, clearly explain what IS available as an alternative.
 - DISCOUNT PERCENTAGE means the price you PAY, not the discount. 80% = you pay 80% = 20% off. 25% = you pay 25% = 75% off.
 - When showing prices, always lead with the CURRENT/DISCOUNTED price, with the original in parenthesis:
   - ✅ "$14.99 (originally $29.99)" or "€23.19 (originally €28.99)"
@@ -524,7 +565,7 @@ export class EGDataAgent extends DurableObject<Env> {
 					const seenTools = new Set<string>();
 
 					const result = streamText({
-						model: mistral("mistral-small-latest"),
+						model: mistral("mistral-large-2512"),
 						system: systemPrompt,
 						messages,
 						tools: allTools,

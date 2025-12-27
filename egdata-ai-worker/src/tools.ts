@@ -355,7 +355,7 @@ export const egdataTools = {
 
 	get_offer_details: tool({
 		description:
-			"Get detailed information about a specific game/offer including description, images, developer, publisher, release date. Use the offer ID from search results.",
+			"Get detailed information about a SINGLE game/offer. For multiple offers, use get_offers_details (plural) instead.",
 		inputSchema: z.object({
 			offerId: z.string().describe("The offer ID to get details for"),
 		}),
@@ -363,9 +363,30 @@ export const egdataTools = {
 			apiRequest(`/offers/${offerId}`),
 	}),
 
+	get_offers_details: tool({
+		description:
+			"Get detailed information about MULTIPLE offers in one call. Use this when comparing multiple games. Much more efficient than calling get_offer_details multiple times.",
+		inputSchema: z.object({
+			offerIds: z.array(z.string()).describe("Array of offer IDs to get details for"),
+		}),
+		execute: async ({ offerIds }, _options: ToolOptions) => {
+			const results = await Promise.all(
+				offerIds.map(async (offerId) => {
+					try {
+						const data = await apiRequest(`/offers/${offerId}`);
+						return { offerId, ...data as object };
+					} catch (error) {
+						return { offerId, error: "Failed to fetch details" };
+					}
+				})
+			);
+			return results;
+		},
+	}),
+
 	get_offer_price: tool({
 		description:
-			"Get current pricing information for a specific offer in a given region. Returns pre-formatted prices (originalPriceFormatted, discountPriceFormatted) - use these directly.",
+			"Get current pricing information for a SINGLE offer. For multiple offers, use get_offer_prices (plural) instead - it's more efficient.",
 		inputSchema: z.object({
 			offerId: z.string().describe("The offer ID to get price for"),
 			country: z
@@ -376,6 +397,33 @@ export const egdataTools = {
 		execute: async ({ offerId, country }, _options: ToolOptions) => {
 			const data = await apiRequest(`/offers/${offerId}/price`, { country: country || "US" });
 			return addFormattedPrices(data);
+		},
+	}),
+
+	get_offer_prices: tool({
+		description:
+			"Get current pricing for MULTIPLE offers in one call. Use this when comparing prices of multiple games (e.g., top sellers comparison). Much more efficient than calling get_offer_price multiple times.",
+		inputSchema: z.object({
+			offerIds: z.array(z.string()).describe("Array of offer IDs to get prices for"),
+			country: z
+				.string()
+				.optional()
+				.describe("Country code for regional pricing (default: US)"),
+		}),
+		execute: async ({ offerIds, country }, _options: ToolOptions) => {
+			const countryCode = country || "US";
+			// Fetch all prices in parallel
+			const results = await Promise.all(
+				offerIds.map(async (offerId) => {
+					try {
+						const data = await apiRequest(`/offers/${offerId}/price`, { country: countryCode });
+						return { offerId, ...addFormattedPrices(data) as object };
+					} catch (error) {
+						return { offerId, error: "Failed to fetch price" };
+					}
+				})
+			);
+			return results;
 		},
 	}),
 
@@ -440,7 +488,7 @@ export const egdataTools = {
 
 	get_top_sellers: tool({
 		description:
-			"Get the current top selling games on Epic Games Store with ranking positions.",
+			"Get the current top selling games on Epic Games Store with ranking positions. NOTE: This returns game titles and IDs only - NO price data. To get prices, you must call get_offer_price for each game ID.",
 		inputSchema: z.object({
 			limit: z.number().optional().describe("Number of results (default: 10)"),
 			page: z.number().optional().describe("Page number"),
@@ -453,7 +501,7 @@ export const egdataTools = {
 	}),
 
 	get_top_wishlisted: tool({
-		description: "Get the most wishlisted games on Epic Games Store.",
+		description: "Get the most wishlisted games on Epic Games Store. NOTE: This returns game titles and IDs only - NO price data. To get prices, you must call get_offer_price for each game ID.",
 		inputSchema: z.object({
 			limit: z.number().optional().describe("Number of results (default: 10)"),
 			page: z.number().optional().describe("Page number"),
@@ -570,7 +618,7 @@ export const egdataTools = {
 
 	get_offer_items: tool({
 		description:
-			"Get all items (executables/entitlements) associated with an offer. Use this to find the downloadable content for a game. Returns item IDs that can be used with get_item_assets to find download sizes.",
+			"Get all items (executables/entitlements) for a SINGLE offer. For multiple offers, use get_offers_items (plural) instead.",
 		inputSchema: z.object({
 			offerId: z.string().describe("The offer ID to get items for"),
 		}),
@@ -578,9 +626,30 @@ export const egdataTools = {
 			apiRequest(`/offers/${offerId}/items`),
 	}),
 
+	get_offers_items: tool({
+		description:
+			"Get items (executables/entitlements) for MULTIPLE offers in one call. Use this when comparing download sizes of multiple games. Returns item IDs that can be used with get_items_assets.",
+		inputSchema: z.object({
+			offerIds: z.array(z.string()).describe("Array of offer IDs to get items for"),
+		}),
+		execute: async ({ offerIds }, _options: ToolOptions) => {
+			const results = await Promise.all(
+				offerIds.map(async (offerId) => {
+					try {
+						const data = await apiRequest(`/offers/${offerId}/items`);
+						return { offerId, items: data };
+					} catch (error) {
+						return { offerId, error: "Failed to fetch items" };
+					}
+				})
+			);
+			return results;
+		},
+	}),
+
 	get_item_assets: tool({
 		description:
-			"Get asset/build information for an item, including download size and installed size per platform. This is the ONLY way to get game download sizes. Returns pre-formatted sizes (downloadSize, installedSize) - use these directly, no math needed.",
+			"Get asset/build information for a SINGLE item. For multiple items, use get_items_assets (plural) instead.",
 		inputSchema: z.object({
 			itemId: z.string().describe("The item ID to get assets for"),
 		}),
@@ -599,6 +668,39 @@ export const egdataTools = {
 				});
 			}
 			return data;
+		},
+	}),
+
+	get_items_assets: tool({
+		description:
+			"Get asset/build information for MULTIPLE items in one call. Use this when comparing download sizes of multiple games. Returns pre-formatted sizes (downloadSize, installedSize).",
+		inputSchema: z.object({
+			itemIds: z.array(z.string()).describe("Array of item IDs to get assets for"),
+		}),
+		execute: async ({ itemIds }, _options: ToolOptions) => {
+			const results = await Promise.all(
+				itemIds.map(async (itemId) => {
+					try {
+						const data = await apiRequest(`/items/${itemId}/assets`);
+						// Add formatted sizes to each asset
+						if (Array.isArray(data)) {
+							const assets = data.map((asset) => {
+								const a = asset as Record<string, unknown>;
+								return {
+									...a,
+									downloadSize: typeof a.downloadSizeBytes === "number" ? formatBytes(a.downloadSizeBytes) : null,
+									installedSize: typeof a.installedSizeBytes === "number" ? formatBytes(a.installedSizeBytes) : null,
+								};
+							});
+							return { itemId, assets };
+						}
+						return { itemId, assets: data };
+					} catch (error) {
+						return { itemId, error: "Failed to fetch assets" };
+					}
+				})
+			);
+			return results;
 		},
 	}),
 };
