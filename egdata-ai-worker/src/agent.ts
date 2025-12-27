@@ -573,7 +573,7 @@ export class EGDataAgent extends DurableObject<Env> {
 					const seenTools = new Set<string>();
 
 					const result = streamText({
-						model: mistral("mistral-large-2512"),
+						model: mistral("mistral-large-latest"),
 						system: systemPrompt,
 						messages,
 						tools: allTools,

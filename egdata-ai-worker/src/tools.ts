@@ -310,14 +310,14 @@ async function apiRequest(
 export const egdataTools = {
 	search_offers: tool({
 		description:
-			"Search for games, DLCs, bundles, and other offers in the Epic Games Store. Use this to find games by name, filter by type, or sort by various criteria.",
+			"Search for games, DLCs, bundles, and other offers in the Epic Games Store. Use this to find games by name, filter by type, or sort by various criteria. IMPORTANT: When searching for prices or download sizes, you MUST use offerType='BASE_GAME' to get accurate results for the main game (not DLCs or editions).",
 		inputSchema: z.object({
 			query: z.string().optional().describe("Search query for game title"),
 			offerType: z
 				.string()
 				.optional()
 				.describe(
-					"Filter by offer type: BASE_GAME, DLC, BUNDLE, ADD_ON, EDITION"
+					"Filter by offer type: BASE_GAME, DLC, BUNDLE, ADD_ON, EDITION. ALWAYS use BASE_GAME when searching for prices or download sizes."
 				),
 			sortBy: z
 				.string()
@@ -386,9 +386,9 @@ export const egdataTools = {
 
 	get_offer_price: tool({
 		description:
-			"Get current pricing information for a SINGLE offer. For multiple offers, use get_offer_prices (plural) instead - it's more efficient.",
+			"Get current pricing information for a SINGLE offer. For multiple offers, use get_offer_prices (plural) instead - it's more efficient. IMPORTANT: For accurate game prices, use offer IDs from BASE_GAME offers only (not DLC, EDITION, or BUNDLE).",
 		inputSchema: z.object({
-			offerId: z.string().describe("The offer ID to get price for"),
+			offerId: z.string().describe("The offer ID to get price for (should be a BASE_GAME offer for accurate pricing)"),
 			country: z
 				.string()
 				.optional()
@@ -402,9 +402,9 @@ export const egdataTools = {
 
 	get_offer_prices: tool({
 		description:
-			"Get current pricing for MULTIPLE offers in one call. Use this when comparing prices of multiple games (e.g., top sellers comparison). Much more efficient than calling get_offer_price multiple times.",
+			"Get current pricing for MULTIPLE offers in one call. Use this when comparing prices of multiple games (e.g., top sellers comparison). Much more efficient than calling get_offer_price multiple times. IMPORTANT: For accurate game prices, use offer IDs from BASE_GAME offers only (not DLC, EDITION, or BUNDLE).",
 		inputSchema: z.object({
-			offerIds: z.array(z.string()).describe("Array of offer IDs to get prices for"),
+			offerIds: z.array(z.string()).describe("Array of offer IDs to get prices for (should be BASE_GAME offers for accurate pricing)"),
 			country: z
 				.string()
 				.optional()
@@ -618,9 +618,9 @@ export const egdataTools = {
 
 	get_offer_items: tool({
 		description:
-			"Get all items (executables/entitlements) for a SINGLE offer. For multiple offers, use get_offers_items (plural) instead.",
+			"Get all items (executables/entitlements) for a SINGLE offer. For multiple offers, use get_offers_items (plural) instead. IMPORTANT: For accurate download sizes, use offer IDs from BASE_GAME offers only.",
 		inputSchema: z.object({
-			offerId: z.string().describe("The offer ID to get items for"),
+			offerId: z.string().describe("The offer ID to get items for (should be a BASE_GAME offer for accurate download sizes)"),
 		}),
 		execute: async ({ offerId }, _options: ToolOptions) =>
 			apiRequest(`/offers/${offerId}/items`),
@@ -628,9 +628,9 @@ export const egdataTools = {
 
 	get_offers_items: tool({
 		description:
-			"Get items (executables/entitlements) for MULTIPLE offers in one call. Use this when comparing download sizes of multiple games. Returns item IDs that can be used with get_items_assets.",
+			"Get items (executables/entitlements) for MULTIPLE offers in one call. Use this when comparing download sizes of multiple games. Returns item IDs that can be used with get_items_assets. IMPORTANT: For accurate download sizes, use offer IDs from BASE_GAME offers only.",
 		inputSchema: z.object({
-			offerIds: z.array(z.string()).describe("Array of offer IDs to get items for"),
+			offerIds: z.array(z.string()).describe("Array of offer IDs to get items for (should be BASE_GAME offers for accurate download sizes)"),
 		}),
 		execute: async ({ offerIds }, _options: ToolOptions) => {
 			const results = await Promise.all(
