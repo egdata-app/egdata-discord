@@ -486,6 +486,39 @@ export const egdataTools = {
 		},
 	}),
 
+	get_top_giveaway_publishers: tool({
+		description:
+			"Get publishers/developers ranked by how many free games they've given away on Epic Games Store. Returns a leaderboard of the most generous publishers. NOT related to best-selling games - use get_top_sellers for sales rankings. Use this for questions like 'which publishers gave away the most free games' or 'how many games has [publisher] gifted'.",
+		inputSchema: z.object({
+			query: z.string().optional().describe("Optional publisher name to search for (case-insensitive partial match)"),
+		}),
+		execute: async ({ query }, _options: ToolOptions) => {
+			const response = await fetch(`${API_BASE}/free-games/sellers`);
+			if (!response.ok) {
+				return { error: `API request failed: ${response.status} ${response.statusText}` };
+			}
+			const data = await response.json() as Array<{ totalSingleGames: number; sellerId: string; sellerName: string }>;
+
+			// If query provided, filter by publisher name
+			if (query) {
+				const lowerQuery = query.toLowerCase();
+				const filtered = data.filter((publisher) =>
+					publisher.sellerName.toLowerCase().includes(lowerQuery)
+				);
+				return filtered.length > 0
+					? filtered
+					: { message: `No publishers found matching "${query}"`, totalPublishers: data.length };
+			}
+
+			// Return top 50 publishers (enough for most queries without token overflow)
+			return {
+				publishers: data.slice(0, 50),
+				totalPublishers: data.length,
+				_note: "Showing top 50 publishers by giveaway count. Use query parameter to search for specific publishers.",
+			};
+		},
+	}),
+
 	get_top_sellers: tool({
 		description:
 			"Get the current top selling games on Epic Games Store with ranking positions. NOTE: This returns game titles and IDs only - NO price data. To get prices, you must call get_offer_price for each game ID.",
