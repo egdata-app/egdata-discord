@@ -53,6 +53,86 @@ export function extractThreadTitle(content: string): { title: string | null; cle
   return { title: null, cleanContent: content };
 }
 
+// Smart truncation that respects markdown structure
+function smartTruncate(content: string, maxLength: number): { text: string; wasTruncated: boolean; originalLength: number } {
+  if (content.length <= maxLength) {
+    return { text: content, wasTruncated: false, originalLength: content.length };
+  }
+
+  const originalLength = content.length;
+  // Reserve space for truncation indicator
+  const reservedSpace = 80;
+  const targetLength = maxLength - reservedSpace;
+
+  // Check if we're in a code block (``` ... ```)
+  const codeBlockRegex = /```[\s\S]*?```/g;
+  const codeBlocks: { start: number; end: number }[] = [];
+  let match;
+  while ((match = codeBlockRegex.exec(content)) !== null) {
+    codeBlocks.push({ start: match.index, end: match.index + match[0].length });
+  }
+
+  // Find the best cut point
+  let cutPoint = targetLength;
+
+  // Check if cut point is inside a code block
+  const insideCodeBlock = codeBlocks.find(b => cutPoint > b.start && cutPoint < b.end);
+  if (insideCodeBlock) {
+    // Cut before the code block starts, or after it ends if it started before our target
+    if (insideCodeBlock.start > 100) {
+      cutPoint = insideCodeBlock.start - 1;
+    } else if (insideCodeBlock.end <= maxLength - 20) {
+      cutPoint = insideCodeBlock.end;
+    }
+  }
+
+  // Try to find a good break point (in order of preference)
+  const searchRegion = content.slice(Math.max(0, cutPoint - 200), cutPoint);
+  const searchOffset = Math.max(0, cutPoint - 200);
+
+  // Priority 1: End of a table row (| ... |\n)
+  const tableRowEnd = searchRegion.lastIndexOf('|\n');
+  if (tableRowEnd !== -1) {
+    cutPoint = searchOffset + tableRowEnd + 2;
+  }
+  // Priority 2: Double newline (paragraph break)
+  else {
+    const paragraphBreak = searchRegion.lastIndexOf('\n\n');
+    if (paragraphBreak !== -1) {
+      cutPoint = searchOffset + paragraphBreak + 2;
+    }
+    // Priority 3: Single newline
+    else {
+      const lineBreak = searchRegion.lastIndexOf('\n');
+      if (lineBreak !== -1) {
+        cutPoint = searchOffset + lineBreak + 1;
+      }
+      // Priority 4: Space (word boundary)
+      else {
+        const space = searchRegion.lastIndexOf(' ');
+        if (space !== -1) {
+          cutPoint = searchOffset + space + 1;
+        }
+      }
+    }
+  }
+
+  let truncated = content.slice(0, cutPoint).trimEnd();
+
+  // Close any unclosed code blocks
+  const openCodeBlocks = (truncated.match(/```/g) || []).length;
+  if (openCodeBlocks % 2 !== 0) {
+    truncated += '\n```';
+  }
+
+  // Add truncation indicator with stats
+  const charsRemoved = originalLength - cutPoint;
+  const percentShown = Math.round((cutPoint / originalLength) * 100);
+  truncated += `\n\n*… ${charsRemoved.toLocaleString()} more characters (${percentShown}% shown)*`;
+
+  return { text: truncated, wasTruncated: true, originalLength };
+}
+
 export class AskCommand extends BaseCommand {
   override data = new SlashCommandBuilder()
     .setName('ask')
@@ -243,18 +323,16 @@ export class AskCommand extends BaseCommand {
     content: string,
     sessionId: string
   ): Promise<void> {
-    const MAX_LENGTH = 4000;
+    // Discord embed description limit is 4096, we use 4000 for safety margin
+    const MAX_EMBED_LENGTH = 4000;
 
-    let displayContent = content;
-    if (content.length > MAX_LENGTH) {
-      displayContent = content.slice(0, MAX_LENGTH) + '...';
-    }
+    const { text: displayContent, wasTruncated } = smartTruncate(content, MAX_EMBED_LENGTH);
 
     const embed = new EmbedBuilder()
       .setDescription(displayContent)
-      .setColor(0x00ff00)
+      .setColor(wasTruncated ? 0xffa500 : 0x00ff00) // Orange if truncated, green otherwise
       .setFooter({
-        text: 'EGData AI',
+        text: wasTruncated ? 'EGData AI • Response truncated' : 'EGData AI',
         iconURL: 'https://egdata.app/logo_simple_white.png',
       })
       .setTimestamp();
@@ -262,8 +340,8 @@ export class AskCommand extends BaseCommand {
     const threadRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId(`create_thread:${sessionId}`)
-        .setLabel('💬 Continue in Thread')
-        .setStyle(ButtonStyle.Secondary)
+        .setLabel(wasTruncated ? '💬 See Full Response in Thread' : '💬 Continue in Thread')
+        .setStyle(wasTruncated ? ButtonStyle.Primary : ButtonStyle.Secondary)
     );
 
     await interaction.editReply({
