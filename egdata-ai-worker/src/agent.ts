@@ -577,7 +577,7 @@ export class EGDataAgent extends Agent<Env, UserState> {
 						| undefined;
 
 					const result = streamText({
-						model: mistral("mistral-large-latest"),
+						model: mistral("magistral-medium-2507"),
 						system: systemPrompt,
 						messages: modelMessages,
 						tools: allTools,
@@ -735,7 +735,7 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		try {
 			const { generateText } = await import("ai");
 			const result = await generateText({
-				model: mistral("mistral-small-latest"),
+				model: mistral("magistral-medium-2507"),
 				system: systemPrompt,
 				messages: modelMessages,
 				tools: allTools,
