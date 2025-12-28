@@ -220,6 +220,7 @@ ${userContext}
 ## Key Concepts
 - **Offer** = Store page (prices, details, requirements). Tools: \`search_offers\`, \`get_offer_details\`, \`get_offer_price\`
 - **Item** = Downloadable file (sizes). Tools: \`get_offer_items\` → \`get_item_assets\`
+- **Regional Availability**: \`countriesBlacklist\` = countries where game is UNAVAILABLE (banned/restricted). \`countriesWhitelist\` = if set, ONLY these countries can access. If whitelist is null and blacklist exists, game is available everywhere EXCEPT blacklisted countries.
 
 ## Efficient Tool Usage
 - **Multiple games?** Use batch tools: \`get_offer_prices\`, \`get_offers_details\`, \`get_offers_items\`

@@ -216,6 +216,9 @@ function simplifyItem(item: unknown): unknown {
 		"entitlementType",
 		"itemType",
 		"releaseInfo",
+		// Regional availability
+		"countriesBlacklist",
+		"countriesWhitelist",
 	];
 
 	for (const field of essentialFields) {
@@ -347,9 +350,9 @@ export const egdataTools = {
 
 	get_offer_details: tool({
 		description:
-			"Get full details for ONE game (description, requirements, release date). " +
+			"Get full details for ONE game (description, requirements, release date, regional availability). " +
 			"For MULTIPLE games, use get_offers_details instead. " +
-			"Returns: title, description, releaseDate, seller, tags, systemRequirements.",
+			"Returns: title, description, releaseDate, seller, tags, systemRequirements, countriesBlacklist, countriesWhitelist.",
 		inputSchema: z.object({
 			offerId: z.string().describe("Offer ID from search_offers"),
 		}),
@@ -359,7 +362,7 @@ export const egdataTools = {
 
 	get_offers_details: tool({
 		description:
-			"Get details for MULTIPLE games in ONE call. Use when comparing games. " +
+			"Get details for MULTIPLE games in ONE call (includes regional availability). Use when comparing games. " +
 			"ALWAYS prefer this over multiple get_offer_details calls. " +
 			"PARALLEL TIP: If you also need prices, call get_offer_prices simultaneously.",
 		inputSchema: z.object({
