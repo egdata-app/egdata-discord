@@ -9,6 +9,7 @@
     "cf-typegen": "wrangler types"
   },
   "dependencies": {
+    "@ai-sdk/google": "^3.0.1",
     "@ai-sdk/mistral": "^3.0.1",
     "@cloudflare/ai-utils": "^1.0.1",
     "agents": "^0.3.0",

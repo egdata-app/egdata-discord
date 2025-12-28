@@ -6,8 +6,8 @@ const API_BASE = "https://api.egdata.app";
 // Helper type for tool options
 type ToolOptions = { abortSignal?: AbortSignal };
 
-// Max size for tool results to avoid token limits
-const MAX_RESULT_LENGTH = 15000;
+// Max size for tool results - Gemini Flash 3 supports 1M tokens, so we can be generous
+const MAX_RESULT_LENGTH = 500000;
 
 // Format bytes to human-readable size (GB, MB, etc.)
 function formatBytes(bytes: number): string {
@@ -77,30 +77,21 @@ function addFormattedPrices(obj: unknown, currencyCode = "USD"): unknown {
 	return result;
 }
 
-// Filter out pre-purchase offers and giveaway placeholder offers from arrays
+// Filter out pre-purchase offers from arrays
 function filterUnwantedOffers(arr: unknown[]): unknown[] {
 	return arr.filter((item) => {
 		if (typeof item === "object" && item !== null) {
 			const record = item as Record<string, unknown>;
 			// Filter out pre-purchase offers
 			if (record.prePurchase === true) return false;
-
-			// Filter out giveaway placeholder offers (mystery games, vault items)
-			// These have dummy items with no real asset data
-			// Identify them by: seller "Epic Dev Test Account" or "freegames/vaulted" category
-			const seller = record.seller as { name?: string } | undefined;
-			if (seller?.name === "Epic Dev Test Account") return false;
-
-			const categories = record.categories as string[] | undefined;
-			if (categories?.includes("freegames/vaulted")) return false;
 		}
 		return true;
 	});
 }
 
-// Truncate large objects to reduce token usage and filter unwanted offers
+// Process results - filter pre-purchase offers and simplify items
 function truncateResult(obj: unknown): unknown {
-	// First, filter unwanted offers (pre-purchase, giveaway placeholders) from any arrays
+	// Filter pre-purchase offers from arrays
 	let filtered = obj;
 	if (Array.isArray(obj)) {
 		filtered = filterUnwantedOffers(obj);
@@ -115,53 +106,31 @@ function truncateResult(obj: unknown): unknown {
 		}
 	}
 
-	const json = JSON.stringify(filtered);
-	if (json.length <= MAX_RESULT_LENGTH) {
-		return filtered;
-	}
-
-	// If it's an array, take fewer items
+	// Simplify items to reduce token usage, but don't truncate count
 	if (Array.isArray(filtered)) {
-		const limited = filtered.slice(0, 5).map((item) => simplifyItem(item));
-		return {
-			items: limited,
-			_truncated: true,
-			_originalCount: filtered.length,
-			_message: `Showing 5 of ${filtered.length} results. Ask for specific details if needed.`,
-		};
+		return filtered.map((item) => simplifyItem(item));
 	}
 
-	// If it has an 'elements', 'hits', or 'offers' array (common in search results)
 	if (typeof filtered === "object" && filtered !== null && !Array.isArray(filtered)) {
 		const record = filtered as Record<string, unknown>;
 		if (Array.isArray(record.elements)) {
-			const items = record.elements as unknown[];
 			return {
 				...record,
-				elements: items.slice(0, 5).map((item) => simplifyItem(item)),
-				_truncated: true,
-				_message: `Showing 5 of ${items.length} results.`,
+				elements: (record.elements as unknown[]).map((item) => simplifyItem(item)),
 			};
 		}
 		if (Array.isArray(record.hits)) {
-			const items = record.hits as unknown[];
 			return {
 				...record,
-				hits: items.slice(0, 5).map((item) => simplifyItem(item)),
-				_truncated: true,
-				_message: `Showing 5 of ${items.length} results.`,
+				hits: (record.hits as unknown[]).map((item) => simplifyItem(item)),
 			};
 		}
 		if (Array.isArray(record.offers)) {
-			const items = record.offers as unknown[];
 			return {
 				...record,
-				offers: items.slice(0, 5).map((item) => simplifyItem(item)),
-				_truncated: true,
-				_message: `Showing 5 of ${items.length} results.`,
+				offers: (record.offers as unknown[]).map((item) => simplifyItem(item)),
 			};
 		}
-		// Single object - simplify it
 		return simplifyItem(filtered);
 	}
 
@@ -310,26 +279,29 @@ async function apiRequest(
 export const egdataTools = {
 	search_offers: tool({
 		description:
-			"Search for games, DLCs, bundles, and other offers in the Epic Games Store. Use this to find games by name, filter by type, or sort by various criteria. IMPORTANT: When searching for prices or download sizes, you MUST use offerType='BASE_GAME' to get accurate results for the main game (not DLCs or editions).",
+			"Search for games in Epic Games Store by name. Returns offer IDs needed for other tools. " +
+			"IMPORTANT: Use offerType='BASE_GAME' for prices/sizes (not DLC/editions). " +
+			"PARALLEL TIP: When comparing multiple games (e.g., 'Cyberpunk vs Witcher'), make SEPARATE search calls for each game in the SAME step. " +
+			"NEXT STEP: After getting IDs, call get_offer_price or get_offer_prices for pricing.",
 		inputSchema: z.object({
-			query: z.string().optional().describe("Search query for game title"),
+			query: z.string().optional().describe("Game title to search"),
 			offerType: z
 				.string()
 				.optional()
 				.describe(
-					"Filter by offer type: BASE_GAME, DLC, BUNDLE, ADD_ON, EDITION. ALWAYS use BASE_GAME when searching for prices or download sizes."
+					"Filter: BASE_GAME, DLC, BUNDLE, ADD_ON, EDITION. Use BASE_GAME for accurate prices/sizes."
 				),
 			sortBy: z
 				.string()
 				.optional()
-				.describe("Sort by: releaseDate, lastModifiedDate, price, discount"),
-			sortDir: z.string().optional().describe("Sort direction: asc or desc"),
-			limit: z.number().optional().describe("Number of results (max 10)"),
-			page: z.number().optional().describe("Page number for pagination"),
+				.describe("Sort: releaseDate, lastModifiedDate, price, discount"),
+			sortDir: z.string().optional().describe("asc or desc"),
+			limit: z.number().optional().describe("Results per page (max 10)"),
+			page: z.number().optional().describe("Page number. For 'top 20', call page=1 AND page=2 in parallel."),
 			country: z
 				.string()
 				.optional()
-				.describe("Country code for regional pricing (e.g., US, GB, DE)"),
+				.describe("Country code (US, GB, DE, etc.)"),
 		}),
 		execute: async (args, _options: ToolOptions) => {
 			const body: Record<string, unknown> = {};
@@ -338,8 +310,10 @@ export const egdataTools = {
 			if (args.sortBy) body.sortBy = args.sortBy;
 			if (args.sortDir) body.sortDir = args.sortDir;
 			// Limit results to avoid token overflow
-			body.limit = Math.min(args.limit || 5, 10);
-			if (args.page) body.page = args.page;
+			const limitNum = Math.min(args.limit || 5, 10);
+			body.limit = limitNum;
+			const pageNum = args.page || 1;
+			body.page = pageNum;
 			if (args.country) body.country = args.country;
 
 			const response = await fetch(`${API_BASE}/search/v2/search`, {
@@ -349,15 +323,35 @@ export const egdataTools = {
 			});
 			const data = await response.json();
 			const truncated = truncateResult(data);
-			return convertDatesToUnix(truncated);
+			const result = convertDatesToUnix(truncated);
+
+			// Add pagination warnings
+			const elements = (result as { hits?: unknown[]; elements?: unknown[] })?.hits ||
+				(result as { elements?: unknown[] })?.elements || [];
+			const elementsArray = Array.isArray(elements) ? elements : [];
+
+			return {
+				...result as object,
+				_pagination: {
+					currentPage: pageNum,
+					resultsOnPage: elementsArray.length,
+					hasMore: elementsArray.length === limitNum,
+					nextPage: elementsArray.length === limitNum ? pageNum + 1 : null,
+				},
+				_hint: elementsArray.length === limitNum
+					? `This is page ${pageNum} (${elementsArray.length} results). More results available - call again with page=${pageNum + 1}.`
+					: `This is page ${pageNum} (${elementsArray.length} results).`,
+			};
 		},
 	}),
 
 	get_offer_details: tool({
 		description:
-			"Get detailed information about a SINGLE game/offer. For multiple offers, use get_offers_details (plural) instead.",
+			"Get full details for ONE game (description, requirements, release date). " +
+			"For MULTIPLE games, use get_offers_details instead. " +
+			"Returns: title, description, releaseDate, seller, tags, systemRequirements.",
 		inputSchema: z.object({
-			offerId: z.string().describe("The offer ID to get details for"),
+			offerId: z.string().describe("Offer ID from search_offers"),
 		}),
 		execute: async ({ offerId }, _options: ToolOptions) =>
 			apiRequest(`/offers/${offerId}`),
@@ -365,9 +359,11 @@ export const egdataTools = {
 
 	get_offers_details: tool({
 		description:
-			"Get detailed information about MULTIPLE offers in one call. Use this when comparing multiple games. Much more efficient than calling get_offer_details multiple times.",
+			"Get details for MULTIPLE games in ONE call. Use when comparing games. " +
+			"ALWAYS prefer this over multiple get_offer_details calls. " +
+			"PARALLEL TIP: If you also need prices, call get_offer_prices simultaneously.",
 		inputSchema: z.object({
-			offerIds: z.array(z.string()).describe("Array of offer IDs to get details for"),
+			offerIds: z.array(z.string()).describe("Array of offer IDs"),
 		}),
 		execute: async ({ offerIds }, _options: ToolOptions) => {
 			const results = await Promise.all(
@@ -386,13 +382,15 @@ export const egdataTools = {
 
 	get_offer_price: tool({
 		description:
-			"Get current pricing information for a SINGLE offer. For multiple offers, use get_offer_prices (plural) instead - it's more efficient. IMPORTANT: For accurate game prices, use offer IDs from BASE_GAME offers only (not DLC, EDITION, or BUNDLE).",
+			"Get current price for ONE game. Returns: originalPrice, discountPrice, discount%. " +
+			"For MULTIPLE games, use get_offer_prices instead. " +
+			"Use BASE_GAME offer IDs only (not DLC/editions).",
 		inputSchema: z.object({
-			offerId: z.string().describe("The offer ID to get price for (should be a BASE_GAME offer for accurate pricing)"),
+			offerId: z.string().describe("Offer ID (BASE_GAME type)"),
 			country: z
 				.string()
 				.optional()
-				.describe("Country code for regional pricing (default: US)"),
+				.describe("Country code (default: US). MUST use user's country if set."),
 		}),
 		execute: async ({ offerId, country }, _options: ToolOptions) => {
 			const data = await apiRequest(`/offers/${offerId}/price`, { country: country || "US" });
@@ -402,13 +400,15 @@ export const egdataTools = {
 
 	get_offer_prices: tool({
 		description:
-			"Get current pricing for MULTIPLE offers in one call. Use this when comparing prices of multiple games (e.g., top sellers comparison). Much more efficient than calling get_offer_price multiple times. IMPORTANT: For accurate game prices, use offer IDs from BASE_GAME offers only (not DLC, EDITION, or BUNDLE).",
+			"Get prices for MULTIPLE games in ONE call. ALWAYS use this for comparisons or lists. " +
+			"REQUIRED after get_top_sellers or get_top_wishlisted (they don't include prices). " +
+			"Returns: originalPrice, discountPrice, discount% for each game.",
 		inputSchema: z.object({
-			offerIds: z.array(z.string()).describe("Array of offer IDs to get prices for (should be BASE_GAME offers for accurate pricing)"),
+			offerIds: z.array(z.string()).describe("Array of offer IDs (BASE_GAME type)"),
 			country: z
 				.string()
 				.optional()
-				.describe("Country code for regional pricing (default: US)"),
+				.describe("Country code (default: US). MUST use user's country if set."),
 		}),
 		execute: async ({ offerIds, country }, _options: ToolOptions) => {
 			const countryCode = country || "US";
@@ -429,13 +429,14 @@ export const egdataTools = {
 
 	get_offer_price_history: tool({
 		description:
-			"Get historical pricing data for a game to see past discounts and price changes. Returns pre-formatted prices.",
+			"Get historical prices and discounts for a game. Shows all past sales and price changes. " +
+			"Returns pre-formatted prices with dates.",
 		inputSchema: z.object({
-			offerId: z.string().describe("The offer ID to get price history for"),
+			offerId: z.string().describe("Offer ID from search_offers"),
 			country: z
 				.string()
 				.optional()
-				.describe("Country code for regional pricing (default: US)"),
+				.describe("Country code (default: US). MUST use user's country if set."),
 		}),
 		execute: async ({ offerId, country }, _options: ToolOptions) => {
 			const data = await apiRequest(`/offers/${offerId}/price-history`, {
@@ -447,12 +448,13 @@ export const egdataTools = {
 
 	get_free_games: tool({
 		description:
-			"Get currently free games on Epic Games Store, including both PC and mobile giveaways. This is the most important tool for finding what games are currently free.",
+			"Get currently free games on Epic Games Store (PC and mobile). " +
+			"Returns: current giveaways with end dates. Use for 'what's free now?' questions.",
 		inputSchema: z.object({
 			country: z
 				.string()
 				.optional()
-				.describe("Country code for regional info (default: US)"),
+				.describe("Country code (default: US)"),
 		}),
 		execute: async ({ country }, _options: ToolOptions) =>
 			apiRequest("/free-games", { country: country || "US" }),
@@ -460,18 +462,37 @@ export const egdataTools = {
 
 	get_free_games_history: tool({
 		description:
-			"Get history of past free game giveaways on Epic Games Store. Returns paginated results (not a total count). Use this to see recent/past giveaways, but NOT for counting total giveaways per year.",
+			"Get past free game giveaways. Returns 15 per page with dates. " +
+			"PAGINATION: For 'last year' queries, call multiple pages in parallel (page=1, page=2, page=3).",
 		inputSchema: z.object({
 			country: z.string().optional().describe("Country code (default: US)"),
-			limit: z.number().optional().describe("Results per page (max 25)"),
-			page: z.number().optional().describe("Page number"),
+			limit: z.number().optional().describe("Per page (default: 15, max 25)"),
+			page: z.number().optional().describe("Page number. Call multiple pages in parallel for date ranges."),
 		}),
-		execute: async ({ country, limit, page }, _options: ToolOptions) =>
-			apiRequest("/free-games/history", {
+		execute: async ({ country, limit, page }, _options: ToolOptions) => {
+			const pageNum = page || 1;
+			const limitNum = Math.min(limit || 15, 25);
+			const result = await apiRequest("/free-games/history", {
 				country: country || "US",
-				limit: String(limit || 10),
-				page: String(page || 1),
-			}),
+				limit: String(limitNum),
+				page: String(pageNum),
+			});
+
+			// Add pagination metadata with explicit warnings
+			const elements = (result as { elements?: unknown[] })?.elements || [];
+			return {
+				...result as object,
+				_pagination: {
+					currentPage: pageNum,
+					resultsOnPage: elements.length,
+					hasMore: elements.length === limitNum,
+					nextPage: elements.length === limitNum ? pageNum + 1 : null,
+				},
+				_hint: elements.length === limitNum
+					? `This is page ${pageNum} (${elements.length} giveaways). More results available - call again with page=${pageNum + 1}.`
+					: `This is the last page (${elements.length} giveaways).`,
+			};
+		},
 	}),
 
 	get_free_games_stats: tool({
@@ -521,29 +542,74 @@ export const egdataTools = {
 
 	get_top_sellers: tool({
 		description:
-			"Get the current top selling games on Epic Games Store with ranking positions. NOTE: This returns game titles and IDs only - NO price data. To get prices, you must call get_offer_price for each game ID.",
+			"Get top selling games on Epic Games Store. Returns game IDs and titles but NO PRICES. " +
+			"NEXT STEP: ALWAYS call get_offer_prices with the returned offer IDs to get pricing. " +
+			"Example flow: get_top_sellers(count=10) → get_offer_prices(offerIds=[...all IDs...])",
 		inputSchema: z.object({
-			limit: z.number().optional().describe("Number of results (default: 10)"),
-			page: z.number().optional().describe("Page number"),
+			count: z.number().optional().describe("Number of games (default: 10, max: 50). Auto-paginates."),
 		}),
-		execute: async ({ limit, page }, _options: ToolOptions) =>
-			apiRequest("/offers/top-sellers", {
-				limit: String(limit || 10),
-				page: String(page || 1),
-			}),
+		execute: async ({ count }, _options: ToolOptions) => {
+			const totalCount = Math.min(count || 10, 50);
+			const perPage = 25; // Max per page
+			const pagesNeeded = Math.ceil(totalCount / perPage);
+
+			// Fetch all pages in parallel
+			const pagePromises = Array.from({ length: pagesNeeded }, (_, i) =>
+				apiRequest("/offers/top-sellers", {
+					limit: String(perPage),
+					page: String(i + 1),
+				})
+			);
+
+			const results = await Promise.all(pagePromises);
+
+			const allElements: unknown[] = [];
+			for (const result of results) {
+				const elements = (result as { elements?: unknown[] })?.elements || [];
+				allElements.push(...elements);
+			}
+
+			return {
+				elements: allElements.slice(0, totalCount),
+				totalReturned: Math.min(allElements.length, totalCount),
+			};
+		},
 	}),
 
 	get_top_wishlisted: tool({
-		description: "Get the most wishlisted games on Epic Games Store. NOTE: This returns game titles and IDs only - NO price data. To get prices, you must call get_offer_price for each game ID.",
+		description:
+			"Get most wishlisted games on Epic Games Store. Returns game IDs and titles but NO PRICES. " +
+			"NEXT STEP: ALWAYS call get_offer_prices with the returned offer IDs to get pricing. " +
+			"Example flow: get_top_wishlisted(count=10) → get_offer_prices(offerIds=[...all IDs...])",
 		inputSchema: z.object({
-			limit: z.number().optional().describe("Number of results (default: 10)"),
-			page: z.number().optional().describe("Page number"),
+			count: z.number().optional().describe("Number of games (default: 10, max: 50). Auto-paginates."),
 		}),
-		execute: async ({ limit, page }, _options: ToolOptions) =>
-			apiRequest("/offers/top-wishlisted", {
-				limit: String(limit || 10),
-				page: String(page || 1),
-			}),
+		execute: async ({ count }, _options: ToolOptions) => {
+			const totalCount = Math.min(count || 10, 50);
+			const perPage = 25; // Max per page
+			const pagesNeeded = Math.ceil(totalCount / perPage);
+
+			// Fetch all pages in parallel
+			const pagePromises = Array.from({ length: pagesNeeded }, (_, i) =>
+				apiRequest("/offers/top-wishlisted", {
+					limit: String(perPage),
+					page: String(i + 1),
+				})
+			);
+
+			const results = await Promise.all(pagePromises);
+
+			const allElements: unknown[] = [];
+			for (const result of results) {
+				const elements = (result as { elements?: unknown[] })?.elements || [];
+				allElements.push(...elements);
+			}
+
+			return {
+				elements: allElements.slice(0, totalCount),
+				totalReturned: Math.min(allElements.length, totalCount),
+			};
+		},
 	}),
 
 	get_featured_discounts: tool({
@@ -554,29 +620,67 @@ export const egdataTools = {
 	}),
 
 	get_upcoming_games: tool({
-		description: "Get upcoming game releases on Epic Games Store.",
+		description:
+			"Get upcoming game releases. Returns release dates and titles. " +
+			"PAGINATION: For more than 10 results, call multiple pages in parallel.",
 		inputSchema: z.object({
-			limit: z.number().optional().describe("Number of results"),
-			page: z.number().optional().describe("Page number"),
+			limit: z.number().optional().describe("Per page (default: 10)"),
+			page: z.number().optional().describe("Page number. Use parallel calls for more results."),
 		}),
-		execute: async ({ limit, page }, _options: ToolOptions) =>
-			apiRequest("/offers/upcoming", {
-				limit: String(limit || 10),
-				page: String(page || 1),
-			}),
+		execute: async ({ limit, page }, _options: ToolOptions) => {
+			const pageNum = page || 1;
+			const limitNum = limit || 10;
+			const result = await apiRequest("/offers/upcoming", {
+				limit: String(limitNum),
+				page: String(pageNum),
+			});
+
+			const elements = (result as { elements?: unknown[] })?.elements || [];
+			return {
+				...result as object,
+				_pagination: {
+					currentPage: pageNum,
+					resultsOnPage: elements.length,
+					hasMore: elements.length === limitNum,
+					nextPage: elements.length === limitNum ? pageNum + 1 : null,
+				},
+				_hint: elements.length === limitNum
+					? `This is page ${pageNum} (${elements.length} games). More results available - call again with page=${pageNum + 1}.`
+					: `This is page ${pageNum} (${elements.length} games).`,
+			};
+		},
 	}),
 
 	get_latest_releases: tool({
-		description: "Get the most recently released games on Epic Games Store.",
+		description:
+			"Get recently released games. Returns release dates and titles. " +
+			"PAGINATION: For more than 10 results, call multiple pages in parallel.",
 		inputSchema: z.object({
-			limit: z.number().optional().describe("Number of results"),
-			page: z.number().optional().describe("Page number"),
+			limit: z.number().optional().describe("Per page (default: 10)"),
+			page: z.number().optional().describe("Page number. Use parallel calls for more results."),
 		}),
-		execute: async ({ limit, page }, _options: ToolOptions) =>
-			apiRequest("/offers/latest-released", {
-				limit: String(limit || 10),
-				page: String(page || 1),
-			}),
+		execute: async ({ limit, page }, _options: ToolOptions) => {
+			const pageNum = page || 1;
+			const limitNum = limit || 10;
+			const result = await apiRequest("/offers/latest-released", {
+				limit: String(limitNum),
+				page: String(pageNum),
+			});
+
+			const elements = (result as { elements?: unknown[] })?.elements || [];
+			return {
+				...result as object,
+				_pagination: {
+					currentPage: pageNum,
+					resultsOnPage: elements.length,
+					hasMore: elements.length === limitNum,
+					nextPage: elements.length === limitNum ? pageNum + 1 : null,
+				},
+				_hint: elements.length === limitNum
+					? `This is page ${pageNum} (${elements.length} games). More results available - call again with page=${pageNum + 1}.`
+					: `This is page ${pageNum} (${elements.length} games).`,
+			};
+		},
 	}),
 
 	search_sellers: tool({
@@ -651,9 +755,11 @@ export const egdataTools = {
 
 	get_offer_items: tool({
 		description:
-			"Get all items (executables/entitlements) for a SINGLE offer. For multiple offers, use get_offers_items (plural) instead. IMPORTANT: For accurate download sizes, use offer IDs from BASE_GAME offers only.",
+			"Get downloadable items for ONE game. Returns item IDs needed for get_item_assets. " +
+			"Use BASE_GAME offer IDs only. Look for entitlementType='EXECUTABLE'. " +
+			"NEXT STEP: Call get_item_assets with item ID to get download/install sizes.",
 		inputSchema: z.object({
-			offerId: z.string().describe("The offer ID to get items for (should be a BASE_GAME offer for accurate download sizes)"),
+			offerId: z.string().describe("Offer ID (BASE_GAME type)"),
 		}),
 		execute: async ({ offerId }, _options: ToolOptions) =>
 			apiRequest(`/offers/${offerId}/items`),
@@ -661,9 +767,11 @@ export const egdataTools = {
 
 	get_offers_items: tool({
 		description:
-			"Get items (executables/entitlements) for MULTIPLE offers in one call. Use this when comparing download sizes of multiple games. Returns item IDs that can be used with get_items_assets. IMPORTANT: For accurate download sizes, use offer IDs from BASE_GAME offers only.",
+			"Get items for MULTIPLE games in ONE call. Use when comparing download sizes. " +
+			"NEXT STEP: Call get_items_assets with all item IDs to get sizes. " +
+			"PARALLEL TIP: Can call simultaneously with get_offer_prices for full comparison.",
 		inputSchema: z.object({
-			offerIds: z.array(z.string()).describe("Array of offer IDs to get items for (should be BASE_GAME offers for accurate download sizes)"),
+			offerIds: z.array(z.string()).describe("Array of offer IDs (BASE_GAME type)"),
 		}),
 		execute: async ({ offerIds }, _options: ToolOptions) => {
 			const results = await Promise.all(
@@ -682,9 +790,11 @@ export const egdataTools = {
 
 	get_item_assets: tool({
 		description:
-			"Get asset/build information for a SINGLE item. For multiple items, use get_items_assets (plural) instead.",
+			"Get download/install sizes for ONE item. Returns: downloadSize, installedSize (pre-formatted). " +
+			"For MULTIPLE items, use get_items_assets instead. " +
+			"If size is '0 B', try a different item ID from get_offer_items.",
 		inputSchema: z.object({
-			itemId: z.string().describe("The item ID to get assets for"),
+			itemId: z.string().describe("Item ID from get_offer_items"),
 		}),
 		execute: async ({ itemId }, _options: ToolOptions) => {
 			const data = await apiRequest(`/items/${itemId}/assets`);
@@ -706,9 +816,10 @@ export const egdataTools = {
 
 	get_items_assets: tool({
 		description:
-			"Get asset/build information for MULTIPLE items in one call. Use this when comparing download sizes of multiple games. Returns pre-formatted sizes (downloadSize, installedSize).",
+			"Get download/install sizes for MULTIPLE items in ONE call. Use for size comparisons. " +
+			"Returns: downloadSize, installedSize (pre-formatted) for each item.",
 		inputSchema: z.object({
-			itemIds: z.array(z.string()).describe("Array of item IDs to get assets for"),
+			itemIds: z.array(z.string()).describe("Array of item IDs from get_offers_items"),
 		}),
 		execute: async ({ itemIds }, _options: ToolOptions) => {
 			const results = await Promise.all(

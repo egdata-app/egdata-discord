@@ -16,12 +16,14 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@types/ws": "^8.18.1",
     "axios": "^1.7.3",
     "consola": "^3.4.2",
     "discord.js": "14.16.3",
     "dotenv": "^16.4.5",
     "ts-dedent": "^2.2.0",
-    "utf-8-validate": "^6.0.4"
+    "utf-8-validate": "^6.0.4",
+    "ws": "^8.18.3"
   },
   "devDependencies": {
     "@parcel/packager-ts": "2.12.0",

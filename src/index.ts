@@ -19,7 +19,7 @@ import { setupHealthCheckServer } from './utils/healthCheck.js';
 import { logger } from './utils/logger.js';
 import consola from 'consola';
 import { client as apiClient } from './utils/client.js';
-import { threadSessions, sessionThreadTitles, extractThreadTitle, AI_WORKER_URL, type SSEEvent } from './commands/ask.js';
+import { threadSessions, sessionThreadTitles, extractThreadTitle, AI_WORKER_URL, pendingAskUserRequests } from './commands/ask.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -263,6 +263,58 @@ async function handleButton(interaction: ButtonInteraction) {
         components: [],
       }).catch(() => {});
     }
+  } else if (action === 'ask_user_response') {
+    // Handle ask_user tool response
+    // Format: ask_user_response:{sessionId}:{requestId}:{optionIndex}
+    const requestId = parts[2];
+    const optionIndex = parseInt(parts[3] || '0', 10);
+
+    if (!sessionId || !requestId) {
+      await interaction.reply({
+        content: '❌ Invalid request.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // Validate user owns this session
+    const sessionUserMatch = sessionId.match(/^discord-(\d+)-[a-z0-9]+-[a-z0-9]+$/);
+    const sessionUserId = sessionUserMatch ? sessionUserMatch[1] : null;
+
+    if (sessionUserId && sessionUserId !== interaction.user.id) {
+      await interaction.reply({
+        content: "❌ You can only respond to your own questions.",
+        ephemeral: true,
+      });
+      return;
+    }
+
+    const pendingKey = `${sessionId}:${requestId}`;
+    const pending = pendingAskUserRequests.get(pendingKey);
+
+    if (!pending) {
+      await interaction.reply({
+        content: '❌ This question has expired. Please try again.',
+        ephemeral: true,
+      });
+      return;
+    }
+
+    // Get the selected option
+    const selectedOption = pending.options[optionIndex] || 'Unknown';
+
+    // Send response via WebSocket
+    pending.wsClient.sendUserResponse(requestId, selectedOption);
+
+    // Update the message to show the selected option
+    await interaction.update({
+      content: `✅ You selected: **${selectedOption}**\n\n*Continuing...*`,
+      components: [],
+    });
+
+    // Clean up and resolve
+    pendingAskUserRequests.delete(pendingKey);
+    pending.resolve();
   }
 }
 
@@ -330,7 +382,7 @@ client.on(Events.MessageCreate, async (message) => {
   }
 });
 
-// Handle messages in AI chat threads
+// Handle messages in AI chat threads (using WebSocket for consistent context)
 async function handleThreadMessage(message: import('discord.js').Message, sessionId: string) {
   const question = message.content.trim();
   if (!question) return;
@@ -345,99 +397,101 @@ async function handleThreadMessage(message: import('discord.js').Message, sessio
     // Show typing indicator
     await channel.sendTyping();
 
-    // Stream response from AI worker
-    const response = await fetch(`${AI_WORKER_URL}/api/chat/stream`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        message: question,
-        sessionId,
-        country: 'US',
-      }),
+    // Use WebSocket for consistent context with /ask command
+    const { AIWebSocketClient } = await import('./utils/ai-websocket.js');
+    const wsClient = new AIWebSocketClient(AI_WORKER_URL, sessionId);
+
+    let fullText = '';
+    let completed = false;
+    let error: string | null = null;
+    let lastTypingTime = 0;
+    const TYPING_INTERVAL = 5000;
+
+    // Set up event handlers
+    wsClient.on('tool_progress', () => {
+      const now = Date.now();
+      if (now - lastTypingTime >= TYPING_INTERVAL) {
+        lastTypingTime = now;
+        channel.sendTyping().catch(() => {});
+      }
     });
 
-    if (!response.ok) {
-      throw new Error(`HTTP error: ${response.status}`);
-    }
-
-    const reader = response.body?.getReader();
-    if (!reader) {
-      throw new Error('No response body');
-    }
-
-    const decoder = new TextDecoder();
-    let buffer = '';
-    let lastUpdateTime = 0;
-    const UPDATE_INTERVAL = 1500;
-
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-
-      buffer += decoder.decode(value, { stream: true });
-
-      const lines = buffer.split('\n');
-      buffer = lines.pop() || '';
-
-      for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try {
-            const event = JSON.parse(line.slice(6)) as SSEEvent;
-
-            if (event.type === 'tool') {
-              const now = Date.now();
-              if (now - lastUpdateTime >= UPDATE_INTERVAL) {
-                lastUpdateTime = now;
-                // Keep typing indicator active
-                await channel.sendTyping().catch(() => {});
-              }
-            } else if (event.type === 'complete') {
-              if (event.text.trim()) {
-                // Strip thread title from response
-                const { cleanContent } = extractThreadTitle(event.text);
-
-                // Discord message limit is 2000 characters
-                const MAX_LENGTH = 1900;
-                let responseText = cleanContent;
-
-                if (responseText.length > MAX_LENGTH) {
-                  responseText = responseText.slice(0, MAX_LENGTH) + '...';
-                }
-
-                await message.reply({
-                  content: responseText,
-                  allowedMentions: { repliedUser: false },
-                });
-              } else {
-                await message.reply({
-                  content: "I couldn't generate a response. Please try again.",
-                  allowedMentions: { repliedUser: false },
-                });
-              }
-              return;
-            } else if (event.type === 'error') {
-              await message.reply({
-                content: `❌ AI Error: ${event.message}`,
-                allowedMentions: { repliedUser: false },
-              });
-              return;
-            }
-          } catch {
-            // Ignore parse errors
-          }
-        }
+    wsClient.on('text_delta', () => {
+      // Keep typing indicator active during streaming
+      const now = Date.now();
+      if (now - lastTypingTime >= TYPING_INTERVAL) {
+        lastTypingTime = now;
+        channel.sendTyping().catch(() => {});
       }
+    });
+
+    wsClient.on('complete', (msg) => {
+      fullText = msg.text;
+      completed = true;
+    });
+
+    wsClient.on('error', (msg) => {
+      error = msg.message;
+      completed = true;
+    });
+
+    // Connect and send message
+    await wsClient.connect();
+    wsClient.sendChat(question);
+
+    // Wait for completion (with timeout)
+    const timeout = 120000; // 2 minutes
+    const startTime = Date.now();
+
+    await new Promise<void>((resolve) => {
+      const checkComplete = () => {
+        if (completed || Date.now() - startTime > timeout) {
+          resolve();
+        } else {
+          setTimeout(checkComplete, 100);
+        }
+      };
+      checkComplete();
+    });
+
+    // Clean up
+    wsClient.disconnect();
+
+    if (error) {
+      await message.reply({
+        content: `❌ AI Error: ${error}`,
+        allowedMentions: { repliedUser: false },
+      });
+      return;
     }
 
-    // If we get here without a complete event
+    if (!fullText.trim()) {
+      await message.reply({
+        content: "I couldn't generate a response. Please try again.",
+        allowedMentions: { repliedUser: false },
+      });
+      return;
+    }
+
+    // Strip thread title from response
+    const { cleanContent } = extractThreadTitle(fullText);
+
+    // Discord message limit is 2000 characters
+    const MAX_LENGTH = 1900;
+    let responseText = cleanContent;
+
+    if (responseText.length > MAX_LENGTH) {
+      responseText = responseText.slice(0, MAX_LENGTH) + '...';
+    }
+
     await message.reply({
-      content: 'Response ended unexpectedly. Please try again.',
+      content: responseText,
       allowedMentions: { repliedUser: false },
     });
-  } catch (error) {
-    logger.error('Thread AI chat error:', error);
+  } catch (err) {
+    logger.error('Thread AI chat error:', err);
     await message.reply({
-      content: `Failed to get AI response: ${error instanceof Error ? error.message : 'Unknown error'}`,
+      content: `Failed to get AI response: ${err instanceof Error ? err.message : 'Unknown error'}`,
       allowedMentions: { repliedUser: false },
     }).catch(() => {});
   }

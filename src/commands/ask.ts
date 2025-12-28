@@ -7,11 +7,17 @@ import {
   ButtonStyle,
 } from 'discord.js';
 import { BaseCommand } from '../types/BaseCommand.js';
+import {
+  AIWebSocketClient,
+  type AskUserMessage,
+  type CompleteMessage,
+  type ToolProgressMessage,
+  type ErrorMessage,
+} from '../utils/ai-websocket.js';
 
 export const AI_WORKER_URL = process.env['AI_WORKER_URL'] || 'http://localhost:8787';
 
 // Track thread ID to session ID mappings for thread-based chat
-// Each /ask command generates a unique session, threads continue that specific session
 export const threadSessions = new Map<string, string>();
 
 // Generate a unique session ID for each /ask command
@@ -24,6 +30,18 @@ function generateSessionId(userId: string): string {
 // Store AI-generated thread titles per session
 export const sessionThreadTitles = new Map<string, string>();
 
+// Store pending ask_user requests per session (for button interactions)
+export const pendingAskUserRequests = new Map<
+  string,
+  {
+    requestId: string;
+    question: string;
+    options: string[];
+    wsClient: AIWebSocketClient;
+    resolve: () => void;
+  }
+>();
+
 // Parse and extract thread title from AI response
 export function extractThreadTitle(content: string): { title: string | null; cleanContent: string } {
   const match = content.match(/<thread-title>(.+?)<\/thread-title>/s);
@@ -34,38 +52,6 @@ export function extractThreadTitle(content: string): { title: string | null; cle
   }
   return { title: null, cleanContent: content };
 }
-
-// Progress event types from the worker
-interface ProgressEvent {
-  type: 'tool';
-  tool: string;
-  message: string;
-}
-
-interface CompleteEvent {
-  type: 'complete';
-  text: string;
-}
-
-interface ErrorEvent {
-  type: 'error';
-  message: string;
-}
-
-interface ConfirmationEvent {
-  type: 'confirmation_required';
-  message: string;
-  data: {
-    country?: string;
-    language?: string;
-    fact?: string;
-  };
-}
-
-export type SSEEvent = ProgressEvent | CompleteEvent | ErrorEvent | ConfirmationEvent;
-
-// Track pending confirmations per session
-export const pendingConfirmations = new Map<string, ConfirmationEvent>();
 
 export class AskCommand extends BaseCommand {
   override data = new SlashCommandBuilder()
@@ -89,133 +75,174 @@ export class AskCommand extends BaseCommand {
       return;
     }
 
-    // Generate a unique session ID for this specific /ask command
-    // Each /ask is isolated; threads continue their own session
     const sessionId = generateSessionId(interaction.user.id);
 
     this.logger.info(`AI question from ${interaction.user.tag}: ${question}`);
 
-    // Defer reply since AI can take a while
     await interaction.deferReply();
 
     try {
-      // Use streaming endpoint for progress updates
-      const response = await fetch(`${AI_WORKER_URL}/api/chat/stream`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          message: question,
-          sessionId,
-          country: 'US',
-        }),
-      });
+      // Create WebSocket connection
+      const wsClient = new AIWebSocketClient(AI_WORKER_URL, sessionId);
 
-      if (!response.ok) {
-        throw new Error(`HTTP error: ${response.status}`);
-      }
-
-      const reader = response.body?.getReader();
-      if (!reader) {
-        throw new Error('No response body');
-      }
-
-      const decoder = new TextDecoder();
-      let buffer = '';
       let currentProgress = 'Thinking...';
       let lastUpdateTime = 0;
-      let pendingConfirmation: ConfirmationEvent | undefined;
-      const UPDATE_INTERVAL = 1000; // Update at most every 1 second
+      const UPDATE_INTERVAL = 1000;
+      let fullText = '';
+      let completed = false;
+      let error: string | null = null;
 
-      // Show initial thinking state
+      // Set up event handlers
+      wsClient.on('tool_progress', (msg: ToolProgressMessage) => {
+        currentProgress = msg.message;
+        const now = Date.now();
+        if (now - lastUpdateTime >= UPDATE_INTERVAL) {
+          this.updateProgress(interaction, currentProgress).catch(() => {});
+          lastUpdateTime = now;
+        }
+      });
+
+      wsClient.on('ask_user', async (msg: AskUserMessage) => {
+        // Store the pending request for button handling
+        await this.handleAskUser(interaction, sessionId, msg, wsClient);
+      });
+
+      wsClient.on('text_delta', () => {
+        // We could show typing indicator here, but we wait for complete
+      });
+
+      wsClient.on('complete', (msg: CompleteMessage) => {
+        fullText = msg.text;
+        completed = true;
+      });
+
+      wsClient.on('error', (msg: ErrorMessage) => {
+        error = msg.message;
+        completed = true;
+      });
+
+      // Connect and send message
+      await wsClient.connect();
+      wsClient.sendChat(question);
+
+      // Show initial progress
       await this.updateProgress(interaction, currentProgress);
 
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
+      // Wait for completion (with timeout)
+      const timeout = 120000; // 2 minutes
+      const startTime = Date.now();
 
-        buffer += decoder.decode(value, { stream: true });
-
-        // Parse SSE events from buffer
-        const lines = buffer.split('\n');
-        buffer = lines.pop() || ''; // Keep incomplete line in buffer
-
-        for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const event = JSON.parse(line.slice(6)) as SSEEvent;
-              this.logger.info('AI event:', event);
-
-              if (event.type === 'tool') {
-                currentProgress = event.message;
-                const now = Date.now();
-                // Throttle updates to avoid rate limiting
-                if (now - lastUpdateTime >= UPDATE_INTERVAL) {
-                  await this.updateProgress(interaction, currentProgress);
-                  lastUpdateTime = now;
-                }
-              } else if (event.type === 'confirmation_required') {
-                // Store the confirmation for later
-                pendingConfirmation = event;
-                pendingConfirmations.set(sessionId, event);
-              } else if (event.type === 'complete') {
-                if (event.text.trim()) {
-                  // Extract and store thread title, display clean content
-                  const { title, cleanContent } = extractThreadTitle(event.text);
-                  if (title) {
-                    sessionThreadTitles.set(sessionId, title);
-                  }
-                  await this.updateResponse(interaction, cleanContent, sessionId, pendingConfirmation);
-                } else {
-                  await interaction.editReply({
-                    content: 'I couldn\'t generate a response. Please try again.',
-                  });
-                }
-                return;
-              } else if (event.type === 'error') {
-                await interaction.editReply({
-                  content: `AI Error: ${event.message}`,
-                });
-                return;
-              }
-            } catch {
-              // Ignore parse errors for incomplete JSON
-            }
+      await new Promise<void>((resolve) => {
+        const checkComplete = () => {
+          if (completed || Date.now() - startTime > timeout) {
+            resolve();
+          } else {
+            setTimeout(checkComplete, 100);
           }
-        }
+        };
+        checkComplete();
+      });
+
+      // Clean up
+      wsClient.disconnect();
+
+      if (error) {
+        await interaction.editReply({
+          content: `AI Error: ${error}`,
+        });
+        return;
       }
 
-      // If we get here without a complete event, something went wrong
+      if (!fullText.trim()) {
+        await interaction.editReply({
+          content: "I couldn't generate a response. Please try again.",
+        });
+        return;
+      }
+
+      // Extract and store thread title
+      const { title, cleanContent } = extractThreadTitle(fullText);
+      if (title) {
+        sessionThreadTitles.set(sessionId, title);
+      }
+
+      await this.updateResponse(interaction, cleanContent, sessionId);
+    } catch (err) {
+      this.logger.error('AI chat error:', err);
       await interaction.editReply({
-        content: 'Response ended unexpectedly. Please try again.',
-      });
-    } catch (error) {
-      this.logger.error('AI chat error:', error);
-      await interaction.editReply({
-        content: `Failed to get AI response: ${error instanceof Error ? error.message : 'Unknown error'}`,
+        content: `Failed to get AI response: ${err instanceof Error ? err.message : 'Unknown error'}`,
       });
     }
   }
 
-  private async updateProgress(
+  private async updateProgress(interaction: CommandInteraction, status: string): Promise<void> {
+    await interaction
+      .editReply({
+        content: `\`💭 ${status}\``,
+        embeds: [],
+      })
+      .catch(() => {});
+  }
+
+  private async handleAskUser(
     interaction: CommandInteraction,
-    status: string
+    sessionId: string,
+    msg: AskUserMessage,
+    wsClient: AIWebSocketClient
   ): Promise<void> {
-    // Use plain text for progress updates (less intrusive than embeds)
-    await interaction.editReply({
-      content: `*⏳ ${status}*`,
-      embeds: []
-    }).catch(() => {
-      // Ignore errors from rate limiting
+    // Create buttons for the options
+    const buttons = msg.options?.slice(0, 5).map((option, index) =>
+      new ButtonBuilder()
+        .setCustomId(`ask_user_response:${sessionId}:${msg.requestId}:${index}`)
+        .setLabel(option.length > 80 ? option.slice(0, 77) + '...' : option)
+        .setStyle(index === 0 ? ButtonStyle.Primary : ButtonStyle.Secondary)
+    ) || [
+      new ButtonBuilder()
+        .setCustomId(`ask_user_response:${sessionId}:${msg.requestId}:0`)
+        .setLabel('Yes')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`ask_user_response:${sessionId}:${msg.requestId}:1`)
+        .setLabel('No')
+        .setStyle(ButtonStyle.Danger),
+    ];
+
+    const row = new ActionRowBuilder<ButtonBuilder>().addComponents(buttons);
+
+    // Store pending request for button handler
+    const pendingPromise = new Promise<void>((resolve) => {
+      pendingAskUserRequests.set(`${sessionId}:${msg.requestId}`, {
+        requestId: msg.requestId,
+        question: msg.question,
+        options: msg.options || ['Yes', 'No'],
+        wsClient,
+        resolve,
+      });
+
+      // Auto-timeout after 60 seconds
+      setTimeout(() => {
+        if (pendingAskUserRequests.has(`${sessionId}:${msg.requestId}`)) {
+          pendingAskUserRequests.delete(`${sessionId}:${msg.requestId}`);
+          resolve();
+        }
+      }, 60000);
     });
+
+    // Show the question with buttons
+    await interaction.editReply({
+      content: `❓ **${msg.question}**`,
+      components: [row],
+    });
+
+    // Wait for user response
+    await pendingPromise;
   }
 
   private async updateResponse(
     interaction: CommandInteraction,
     content: string,
-    sessionId: string,
-    confirmation?: ConfirmationEvent
+    sessionId: string
   ): Promise<void> {
-    // Discord embed description limit is 4096 characters
     const MAX_LENGTH = 4000;
 
     let displayContent = content;
@@ -232,40 +259,18 @@ export class AskCommand extends BaseCommand {
       })
       .setTimestamp();
 
-    const components: ActionRowBuilder<ButtonBuilder>[] = [];
-
-    // Add button to continue conversation in a thread
     const threadRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
       new ButtonBuilder()
         .setCustomId(`create_thread:${sessionId}`)
         .setLabel('💬 Continue in Thread')
         .setStyle(ButtonStyle.Secondary)
     );
-    components.push(threadRow);
 
-    // Clear the progress text and show the embed with buttons
-    await interaction.editReply({ content: '', embeds: [embed], components });
-
-    // If there's a pending confirmation, send it as an ephemeral follow-up
-    // so only the user who asked can see and interact with it
-    if (confirmation) {
-      const confirmRow = new ActionRowBuilder<ButtonBuilder>().addComponents(
-        new ButtonBuilder()
-          .setCustomId(`confirm_save:${sessionId}`)
-          .setLabel('✅ Yes, remember this')
-          .setStyle(ButtonStyle.Success),
-        new ButtonBuilder()
-          .setCustomId(`reject_save:${sessionId}`)
-          .setLabel('❌ No thanks')
-          .setStyle(ButtonStyle.Secondary)
-      );
-
-      await interaction.followUp({
-        content: `💾 **Remember this?**\n${confirmation.message}`,
-        components: [confirmRow],
-        ephemeral: true,
-      });
-    }
+    await interaction.editReply({
+      content: '',
+      embeds: [embed],
+      components: [threadRow],
+    });
   }
 }
 

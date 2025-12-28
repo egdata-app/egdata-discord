@@ -1,8 +1,25 @@
-import { Agent } from "agents";
-import { streamText, tool, stepCountIs } from "ai";
-import { mistral } from "@ai-sdk/mistral";
+import {
+	Agent,
+	type Connection,
+	type ConnectionContext,
+	routeAgentRequest,
+	getAgentByName,
+} from "agents";
+
+// Re-export for use in index.ts
+export { routeAgentRequest, getAgentByName };
+import { streamText, generateText, tool, stepCountIs } from "ai";
+import {
+	google,
+	type GoogleGenerativeAIProviderOptions,
+} from "@ai-sdk/google";
 import { z } from "zod";
 import { egdataTools } from "./tools";
+import type {
+	ClientMessage,
+	AgentMessage,
+	PendingQuestion,
+} from "./websocket-types";
 
 // User-level state persisted across all conversations (managed by Agent.state)
 interface UserState {
@@ -27,261 +44,206 @@ const initialState: UserState = {
 	facts: [],
 };
 
-// Human-readable tool names for progress updates
-const TOOL_DESCRIPTIONS: Record<string, string> = {
-	search_offers: "Searching for games...",
-	get_offer_details: "Getting game details...",
-	get_offers_details: "Getting details for multiple games...",
-	get_offer_price: "Checking current price...",
-	get_offer_prices: "Fetching prices for multiple games...",
-	get_offer_price_history: "Fetching price history...",
-	get_free_games: "Finding free games...",
-	get_free_games_history: "Loading giveaway history...",
-	get_free_games_stats: "Getting giveaway stats...",
-	get_top_sellers: "Checking top sellers...",
-	get_top_wishlisted: "Checking most wishlisted...",
-	get_featured_discounts: "Finding deals...",
-	get_upcoming_games: "Checking upcoming releases...",
-	get_latest_releases: "Checking latest releases...",
-	search_sellers: "Searching publishers...",
-	get_promotions: "Checking promotions...",
-	get_store_stats: "Getting store stats...",
-	get_offer_achievements: "Loading achievements...",
-	get_offer_reviews_summary: "Checking reviews...",
-	get_offer_hltb: "Getting playtime info...",
-	get_offer_related: "Finding related games...",
-	search_items: "Searching executables/entitlements...",
-	get_offer_items: "Getting downloadable items...",
-	get_offers_items: "Getting items for multiple games...",
-	get_item_assets: "Checking download size...",
-	get_items_assets: "Checking download sizes for multiple games...",
-	get_top_giveaway_publishers: "Checking top giveaway publishers...",
-	propose_save_context: "Preparing to remember...",
-};
+// Dynamic tool descriptions based on arguments
+type ToolArgs = Record<string, unknown>;
+
+function getToolDescription(toolName: string, args: ToolArgs): string {
+	// Helper to truncate long strings
+	const truncate = (s: string, max = 30) =>
+		s.length > max ? s.slice(0, max - 1) + "…" : s;
+
+	// Helper to get query/title from args
+	const query = args.query as string | undefined;
+	const offerId = args.offerId as string | undefined;
+	const count = args.count as number | undefined;
+	const page = args.page as number | undefined;
+
+	switch (toolName) {
+		// Search tools - show what's being searched
+		case "search_offers":
+			return query
+				? `Searching "${truncate(query)}"...`
+				: "Searching games...";
+		case "search_sellers":
+			return query
+				? `Finding publisher "${truncate(query)}"...`
+				: "Searching publishers...";
+		case "search_items":
+			return query
+				? `Searching items "${truncate(query)}"...`
+				: "Searching items...";
+
+		// Single offer tools - could show ID prefix
+		case "get_offer_details":
+			return offerId
+				? `Loading details [${offerId.slice(0, 8)}...]`
+				: "Getting game details...";
+		case "get_offer_price":
+			return offerId
+				? `Checking price [${offerId.slice(0, 8)}...]`
+				: "Checking price...";
+		case "get_offer_price_history":
+			return "Loading price history...";
+		case "get_offer_achievements":
+			return "Loading achievements...";
+		case "get_offer_reviews_summary":
+			return "Checking reviews...";
+		case "get_offer_hltb":
+			return "Getting playtime estimates...";
+		case "get_offer_related":
+			return "Finding related games...";
+		case "get_offer_items":
+			return "Getting downloadable files...";
+		case "get_item_assets":
+			return "Checking download size...";
+
+		// Batch tools - show count
+		case "get_offers_details": {
+			const ids = args.offerIds as string[] | undefined;
+			return ids?.length
+				? `Loading ${ids.length} game details...`
+				: "Getting details for multiple games...";
+		}
+		case "get_offer_prices": {
+			const ids = args.offerIds as string[] | undefined;
+			return ids?.length
+				? `Fetching ${ids.length} prices...`
+				: "Fetching prices...";
+		}
+		case "get_offers_items": {
+			const ids = args.offerIds as string[] | undefined;
+			return ids?.length
+				? `Getting items for ${ids.length} games...`
+				: "Getting items...";
+		}
+		case "get_items_assets": {
+			const ids = args.itemIds as string[] | undefined;
+			return ids?.length
+				? `Checking ${ids.length} download sizes...`
+				: "Checking download sizes...";
+		}
+
+		// Top lists - show count if specified
+		case "get_top_sellers":
+			return count
+				? `Finding top ${count} sellers...`
+				: "Checking top sellers...";
+		case "get_top_wishlisted":
+			return count
+				? `Finding top ${count} wishlisted...`
+				: "Checking most wishlisted...";
+
+		// Free games
+		case "get_free_games":
+			return "Finding current free games...";
+		case "get_free_games_history":
+			return page && page > 1
+				? `Loading giveaway history (page ${page})...`
+				: "Loading giveaway history...";
+		case "get_free_games_stats":
+			return "Calculating giveaway stats...";
+		case "get_top_giveaway_publishers": {
+			const pubQuery = args.query as string | undefined;
+			return pubQuery
+				? `Finding "${truncate(pubQuery)}" giveaways...`
+				: "Ranking giveaway publishers...";
+		}
+
+		// Other
+		case "get_featured_discounts":
+			return "Finding current deals...";
+		case "get_upcoming_games":
+			return page && page > 1
+				? `Checking upcoming (page ${page})...`
+				: "Checking upcoming releases...";
+		case "get_latest_releases":
+			return page && page > 1
+				? `Checking releases (page ${page})...`
+				: "Checking latest releases...";
+		case "get_promotions":
+			return "Checking active promotions...";
+		case "get_store_stats":
+			return "Getting store statistics...";
+
+		// Human-in-the-loop
+		case "propose_save_context":
+			return "Preparing to remember...";
+		case "ask_user":
+			return "Waiting for your response...";
+
+		default:
+			return `Using ${toolName}...`;
+	}
+}
 
 // Generate system prompt with current date and user context
-function getSystemPrompt(userState: UserState): string {
+function getSystemPrompt(userState: UserState, hasAskUser: boolean): string {
 	const now = new Date();
 	const dateStr = now.toLocaleDateString("en-US", {
 		weekday: "long",
 		year: "numeric",
 		month: "long",
 		day: "numeric",
+		hour: "2-digit",
+		minute: "2-digit",
+		timeZoneName: "short",
 	});
 
-	let userContext = "";
+	// Build user context section
 	const contextParts: string[] = [];
 	if (userState.country)
-		contextParts.push(
-			`- User's country: ${userState.country} (use this for pricing) - ALREADY SAVED, don't propose saving again`
-		);
+		contextParts.push(`- Country: "${userState.country}" (USE IN ALL price/region tool calls)`);
 	if (userState.language)
-		contextParts.push(
-			`- User's preferred language: ${userState.language} - ALREADY SAVED, don't propose saving again`
-		);
+		contextParts.push(`- Language: "${userState.language}"`);
 	if (userState.facts.length > 0)
-		contextParts.push(
-			`- Things user has shared: ${userState.facts.join("; ")} - ALREADY SAVED`
-		);
-	if (userState.pendingConfirmation) {
-		contextParts.push(
-			`- PENDING CONFIRMATION: ${userState.pendingConfirmation.message} - DO NOT propose saving the same info again, wait for user to confirm/reject`
-		);
-	}
-	if (contextParts.length > 0) {
-		userContext = `\n\n## User Context (remembered from previous conversations)\n${contextParts.join("\n")}`;
-	}
+		contextParts.push(`- Facts: ${userState.facts.join("; ")}`);
+	if (userState.pendingConfirmation)
+		contextParts.push(`- PENDING: ${userState.pendingConfirmation.message}`);
 
-	return `You are EGData AI, an expert assistant for the Epic Games Store. You have access to real-time data from the EGData API.
+	const userContext = contextParts.length > 0
+		? `\n## User Context\n${contextParts.join("\n")}\n`
+		: "";
 
-**Current Date: ${dateStr}**
+	const askUserSection = hasAskUser
+		? `\n## Clarification (ask_user)\nUse ONLY when truly ambiguous: "God of War" (2018 or Ragnarök?), vague preferences ("cheap game" → ask genre/budget).\n`
+		: "";
 
-## EGS Terminology
-- **Offer** = A purchasable product (game, DLC, edition, bundle). When users say "game", they mean an offer.
-- **Item** = The executable/entitlement that appears in the Epic Games Launcher. When you buy an offer, you get items (the actual downloadable content). Items have entitlementType (EXECUTABLE, CONSUMABLE, etc.) and represent what you can install/run.
-- **Asset** = Build/release data for an item, including download and installed sizes per platform.
-- **Namespace** = Container grouping all content for a product (base game + DLCs share a namespace)
-- Offer types: BASE_GAME, DLC, EDITION, BUNDLE, ADD_ON
+	// Optimized prompt: context first, then guidelines, strict rules at END (Gemini anchors on final instructions)
+	return `You are EGData AI, an Epic Games Store assistant.
+**Current: ${dateStr}**
+${userContext}
+## Core Rules
+- **Data First**: No internal knowledge. Only use tool results.
+- **Silent Execution**: No narration ("Let me check..."). Output final answer only.
+- **Parallel Calls**: When comparing multiple games, call tools for ALL games simultaneously in ONE step.
 
-## CRITICAL: Ignore Pre-purchase Offers
-Epic often has TWO offers for the same game - a pre-purchase (\`prePurchase: true\`) and a regular offer (\`prePurchase: null\`).
+## Key Concepts
+- **Offer** = Store page (prices, details, requirements). Tools: \`search_offers\`, \`get_offer_details\`, \`get_offer_price\`
+- **Item** = Downloadable file (sizes). Tools: \`get_offer_items\` → \`get_item_assets\`
 
-**NEVER mention pre-purchase offers.** When you see multiple offers:
-1. Find the one with \`prePurchase: null\` (the regular offer)
-2. Use ONLY that offer for price info
-3. Pretend the pre-purchase offer doesn't exist - do NOT mention it at all
-4. Only if NO regular offer exists, mention it's available for pre-order only
-
-## IMPORTANT: Tool Workflow
-Most tools require an offer ID. To get details about a specific game:
-1. First call search_offers with the game name to find the offer ID
-2. Then use that ID with get_offer_details, get_offer_price, get_offer_price_history, etc.
-
-Example: "What's the price history for Cyberpunk?"
-→ Step 1: search_offers(query: "Cyberpunk") → get the offer ID from results
-→ Step 2: get_offer_price_history(offerId: "the-id-from-search")
-
-Example: "What's the download size for Fortnite?"
-→ Step 1: search_offers(query: "Fortnite") → get the offer ID
-→ Step 2: get_offer_items(offerId: "...") → get item IDs
-→ Step 3: Find the EXECUTABLE item with the right platform (Windows) in releaseInfo
-→ Step 4: get_item_assets(itemId: "...") → use the pre-formatted \`downloadSize\` and \`installedSize\` fields directly
-
-IMPORTANT for download sizes:
-- Look for items with \`entitlementType: "EXECUTABLE"\` and \`releaseInfo.platform\` including "Windows"
-- If the first offer has no Windows executable, try other offers from search results
-- Some games (like Fortnite) have Windows in an OTHERS offer, not the BASE_GAME
-- If get_item_assets returns empty [], try items from other offers
-- **USE PRE-FORMATTED VALUES**: Tools return \`downloadSize\` and \`installedSize\` as human-readable strings (e.g., "42.74 GB"). Use these directly - DO NOT do any math.
-- **SANITY CHECK**: No single game exceeds 300 GB. If you see >300 GB, you picked the wrong item. Try a different item.
-
-## Your tools
-**Single item tools:**
-- search_offers: Find games by name (returns offer IDs)
-- get_offer_details: Get game info (needs offer ID)
-- get_offer_price: Current price (needs offer ID)
-- get_offer_price_history: Historical prices (needs offer ID)
-- get_offer_items: Get items/executables for an offer (needs offer ID)
-- get_item_assets: Get download/install sizes per platform (needs item ID)
-
-**Bulk tools (use these for comparisons - much more efficient!):**
-- get_offers_details: Get details for MULTIPLE offers in one call
-- get_offer_prices: Get prices for MULTIPLE offers in one call
-- get_offers_items: Get items for MULTIPLE offers in one call
-- get_items_assets: Get assets/sizes for MULTIPLE items in one call
-
-**Other tools:**
-- get_free_games: Current free games (no ID needed)
-- get_free_games_history: Recent past giveaways (PAGINATED - can't count totals per year!)
-- get_free_games_stats: ALL-TIME stats since 2018 (total count & value, NOT year-specific)
-- get_top_sellers, get_top_wishlisted: Charts (no ID needed, NO price data - use get_offer_prices after!)
-- get_offer_achievements, get_offer_reviews_summary, get_offer_hltb: Game metadata (needs offer ID)
-- propose_save_context: Propose saving user info (country, preferences) - user will confirm
+## Efficient Tool Usage
+- **Multiple games?** Use batch tools: \`get_offer_prices\`, \`get_offers_details\`, \`get_offers_items\`
+- **Top sellers/wishlisted with prices?** Call \`get_top_sellers\` then \`get_offer_prices\` with all IDs
+- **Pagination**: Tools return ~10 results. For "Top 20", call with page=1 AND page=2 in parallel.
+${askUserSection}
+## Output Format
+- **Prices**: **$14.99** ~~$59.99~~ (-75%) — discounted first
+- **Dates**: Use Discord timestamps: <t:1735480000:R> (renders as "in 2 days")
+- **Tables**: MUST be in code blocks (Discord doesn't render markdown tables)
 
 ## Limitations
-- You CANNOT count giveaways for a specific year - stats are all-time only, history is paginated
-- NEVER make up or estimate year-specific counts - you don't have this data!
-- If asked "how many giveaways in [year]", say: "I can only provide all-time stats (X giveaways since 2018) or show you recent giveaways. I don't have year-specific counts."
+- No real-time player counts
+- Cannot check user's library/inventory
+- HowLongToBeat estimates only (no actual playtime)
 
-## Response Formatting (Discord Markdown)
-Format responses to be visually appealing and easy to read. Use Discord markdown:
+## STRICT RULES (NEVER BREAK)
+1. **Regional Pricing**: If user country is set, ALWAYS pass it to price tools. Never default to US.
+2. **Ignore Pre-Purchase**: Skip offers with \`prePurchase: true\` if a released version exists.
+3. **No Manual Math**: Use pre-formatted price strings from API, never calculate discounts.
+4. **Thread Title**: ALWAYS end response with \`<thread-title>Short Title</thread-title>\`
+5. **Tables in Code Blocks**: \`\`\`markdown tables\`\`\` or they break in Discord.
 
-**Text Styles:**
-- **Bold**: \`**text**\` → **important info**
-- *Italic*: \`*text*\` → *emphasis*
-- __Underline__: \`__text__\` → __key points__
-- ~~Strikethrough~~: \`~~text~~\` → ~~original prices~~
-- Combine: \`***bold italic***\`, \`__**underline bold**__\`
-
-**Structure:**
-- Headers: \`# Big\`, \`## Medium\`, \`### Small\` (must be on new line)
-- Subtext: \`-# small text\` for footnotes
-- Lists: \`- item\` or \`* item\`
-- Block quotes: \`> quoted text\`
-- Code: \`\\\`inline\\\`\` or \`\\\`\\\`\\\`block\\\`\\\`\\\`\`
-
-**Tables (IMPORTANT):**
-Discord does NOT render markdown tables. For comparison data, use a code block:
-\`\`\`
-| Game       | Download   | Installed  |
-|------------|------------|------------|
-| Zero Hour  | 18.34 GB   | 35.90 GB   |
-| Sifu       | 23.59 GB   | 32.56 GB   |
-\`\`\`
-- Always wrap tables in triple backticks (\`\`\`)
-- Align columns with spaces for readability
-- Keep tables simple - avoid complex multi-line cells
-
-**Best Practices:**
-- Use **bold** for game titles, prices, sale names
-- Use ~~strikethrough~~ for original prices when discounted
-- Use line breaks generously - improves readability
-- Use bullet points for multiple items
-- Keep responses concise but well-structured
-
-Example price response:
-**[Grand Theft Auto V](https://egdata.app/offers/xxx)** is on sale!
-
-💰 **$14.99** ~~$29.99~~ (50% off)
-🏷️ Holiday Sale 2024
-📅 Ends <t:1234567890:R>
-
-## ABSOLUTE RULE: Every Price Requires a Tool Call
-**You have NO internal knowledge of game prices.** The ONLY way to know a price is to call get_offer_price or get_offer_prices.
-- Prices in conversation history are ONLY valid for the country they were fetched for
-- You CANNOT convert, estimate, or calculate prices for other countries
-- If user asks for prices in a different country → CALL THE TOOL AGAIN
-- If you show a price without having called the price tool for that specific country → YOU ARE HALLUCINATING
-- When in doubt, call the tool. It's better to call it twice than to guess once.
-
-## Guidelines
-- **USE KNOWN ENTITIES**: When following up on games already discussed, use the IDs from "Known Entities" below - no need to search again.
-- **BATCH OPERATIONS ARE OK**: If user asks to add data for multiple games (e.g., "add prices to the table"), DO IT. Call the necessary tools for each game. Don't refuse batch requests.
-- **BE FOCUSED**: Only fetch data types the user asked for.
-  - Price question → search_offers + get_offer_price (NOT get_offer_items, get_item_assets)
-  - Download size question → search_offers + get_offer_items + get_item_assets
-  - Game info question → search_offers + get_offer_details
-- **ONE GAME PER QUESTION** (for initial queries): When user asks about a specific game, only show info for THAT game.
-  - "God of War 1" or "God of War" → only the 2018 God of War game, NOT Ragnarok or soundtracks
-  - But if user says "add X to the comparison" or "show prices for all", include all requested games
-- **propose_save_context**: ONLY use when user EXPLICITLY shares NEW personal info (says "I'm from Spain", "I prefer Spanish", etc.)
-  - NEVER call if you already know their country from User Context above
-  - NEVER call if there's a PENDING CONFIRMATION
-  - NEVER infer country from price queries - only save if user explicitly tells you
-  - If user just asks for a price and you show it in their local currency, that's fine - don't ask to save
-- **USE PRE-FORMATTED PRICES**: Price tools return \`originalPriceFormatted\`, \`discountPriceFormatted\`, etc. Use these directly - DO NOT do any math on price values.
-
-## CRITICAL: Never Hallucinate Data
-- **get_top_sellers and get_top_wishlisted do NOT include price data** - they only return game titles and IDs
-- To get prices for multiple games, use **get_offer_prices** (plural) with an array of offer IDs
-- **NEVER make up or guess prices** - if you didn't fetch the price, you don't know it
-- Example: "Compare prices of top 5 sellers" requires:
-  1. Call get_top_sellers → get 5 game IDs
-  2. Call get_offer_prices with all 5 IDs in one call
-  3. ONLY then can you show a price table
-
-## Search Results: Look at ALL Results
-- Search results may contain multiple offers for the same game (pre-purchase, regular, editions)
-- **ALWAYS look through ALL results** - don't stop at the first one
-- Look for the offer with \`prePurchase: null\` (the regular offer) - this is the one to use
-- A game EXISTS if ANY result has \`prePurchase: null\`, even if the first result is pre-purchase
-
-## Stay On Topic
-- If a search returns results, USE those results - don't claim the game doesn't exist
-- **NEVER suggest unrelated games** when the user asks about a specific game
-- If you can't find a game, say "I couldn't find [game name] in the Epic Games Store" - don't pivot to free games or other suggestions
-- Only suggest alternatives if the user explicitly asks for recommendations
-
-## Unsupported Queries
-These data types are NOT available - be honest about it:
-- "Most played games" / player counts - NOT AVAILABLE (only have top sellers and wishlisted)
-- Year-specific giveaway counts - NOT AVAILABLE (only have all-time stats)
-- Real-time player numbers - NOT AVAILABLE
-If user asks for unavailable data, clearly explain what IS available as an alternative.
-- DISCOUNT PERCENTAGE means the price you PAY, not the discount. 80% = you pay 80% = 20% off. 25% = you pay 25% = 75% off.
-- When showing prices, always lead with the CURRENT/DISCOUNTED price, with the original in parenthesis:
-  - ✅ "$14.99 (originally $29.99)" or "€23.19 (originally €28.99)"
-  - ❌ "originally $29.99, now $14.99"
-- For free games, just call get_free_games once
-- Always search first if you need an offer ID
-- Include links to EGData when mentioning offers/items/sandboxes using markdown:
-  - Offers: [Game Title](https://egdata.app/offers/{offerId})
-  - Items: [Item Name](https://egdata.app/items/{itemId})
-  - Sandboxes: [Sandbox](https://egdata.app/sandboxes/{sandboxId})
-- Dates in API responses include pre-computed Unix timestamps: { _isoDate: "...", _unixTimestamp: 1767196800 }
-  - Use the _unixTimestamp value directly for Discord format: <t:UNIX_TIMESTAMP:FORMAT>
-  - Formats: F (full), f (short), D (date), d (short date), R (relative)
-  - Example: <t:1767196800:R> for relative time like "in 3 days"
-
-## Thread Title (IMPORTANT)
-At the END of EVERY response, add a thread title in this exact format:
-<thread-title>Short Topic Title</thread-title>
-
-The title should be:
-- 3-6 words summarizing what the conversation is about
-- Based on the user's question and your answer
-- No emoji, no quotes, just plain text
-- Examples: "GTA V Price Check", "Free Games This Week", "Cyberpunk Download Size", "Top Wishlisted Games"${userContext}`;
+<thread-title>Example Title</thread-title>`;
 }
 
 // Tool for proposing to save user context (human-in-the-loop)
@@ -332,11 +294,16 @@ export class EGDataAgent extends Agent<Env, UserState> {
 	// Initial state for new agents
 	initialState: UserState = initialState;
 
+	// Pending questions waiting for user response (keyed by requestId)
+	private pendingQuestions = new Map<string, PendingQuestion>();
+
+	// Active connections (keyed by sessionId)
+	private activeConnections = new Map<string, Connection>();
+
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, env);
 
 		// Initialize messages table (per-session context)
-		// Messages need SQL for querying by session, state doesn't support this
 		this.sql`
 			CREATE TABLE IF NOT EXISTS messages (
 				id TEXT PRIMARY KEY,
@@ -360,7 +327,280 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		`;
 	}
 
-	// Get recent conversation history from SQL (isolated per session)
+	// ==========================================================================
+	// WebSocket Handlers (using Agents SDK Connection type)
+	// ==========================================================================
+
+	// Handle new WebSocket connection
+	override onConnect(connection: Connection, ctx: ConnectionContext): void {
+		// Extract session ID from query params
+		const url = new URL(ctx.request.url);
+		const sessionId = url.searchParams.get("sessionId") || "default";
+		this.activeConnections.set(sessionId, connection);
+		console.log(`WebSocket connected: ${sessionId}`);
+	}
+
+	// Handle incoming WebSocket message
+	override async onMessage(connection: Connection, message: string | ArrayBuffer): Promise<void> {
+		if (typeof message !== "string") {
+			return; // Only handle string messages
+		}
+
+		try {
+			const data = JSON.parse(message) as ClientMessage;
+
+			switch (data.type) {
+				case "chat":
+					await this.handleWebSocketChat(connection, data.message, data.sessionId);
+					break;
+
+				case "user_response":
+					this.handleUserResponse(data.requestId, data.response);
+					break;
+
+				default:
+					this.sendToConnection(connection, {
+						type: "error",
+						message: `Unknown message type: ${(data as { type: string }).type}`,
+					});
+			}
+		} catch (error) {
+			console.error("WebSocket message error:", error);
+			this.sendToConnection(connection, {
+				type: "error",
+				message: error instanceof Error ? error.message : "Invalid message",
+			});
+		}
+	}
+
+	// Handle WebSocket close
+	override onClose(connection: Connection): void {
+		// Remove from active connections
+		for (const [sessionId, conn] of this.activeConnections.entries()) {
+			if (conn.id === connection.id) {
+				this.activeConnections.delete(sessionId);
+				console.log(`WebSocket disconnected: ${sessionId}`);
+				break;
+			}
+		}
+
+		// Reject any pending questions for this connection
+		for (const [requestId, pending] of this.pendingQuestions.entries()) {
+			clearTimeout(pending.timeout);
+			pending.reject(new Error("WebSocket disconnected"));
+			this.pendingQuestions.delete(requestId);
+		}
+	}
+
+	// Send message via Connection
+	private sendToConnection(connection: Connection, message: AgentMessage): void {
+		connection.send(JSON.stringify(message));
+	}
+
+	// Handle user response to a pending question
+	private handleUserResponse(requestId: string, response: string): void {
+		const pending = this.pendingQuestions.get(requestId);
+		if (pending) {
+			clearTimeout(pending.timeout);
+			pending.resolve(response);
+			this.pendingQuestions.delete(requestId);
+		}
+	}
+
+	// Create ask_user tool for a specific connection
+	private createAskUserTool(connection: Connection) {
+		const agent = this;
+		type ToolOptions = { abortSignal?: AbortSignal };
+
+		return tool({
+			description:
+				"Ask the user a clarifying question and wait for their response. Use sparingly - only when the request is truly ambiguous. Returns the user's response as a string.",
+			inputSchema: z.object({
+				question: z.string().describe("The question to ask the user"),
+				options: z
+					.array(z.string())
+					.optional()
+					.describe(
+						'Predefined options for the user to choose from (e.g., ["God of War (2018)", "God of War Ragnarök"]). If not provided, defaults to yes/no.'
+					),
+				allowText: z
+					.boolean()
+					.optional()
+					.describe(
+						"If true, allow free text input in addition to predefined options"
+					),
+			}),
+			execute: async (
+				{ question, options, allowText },
+				_options: ToolOptions
+			) => {
+				const requestId = crypto.randomUUID();
+				const timeoutMs = 60000; // 60 second timeout
+
+				// Send question to client
+				agent.sendToConnection(connection, {
+					type: "ask_user",
+					requestId,
+					question,
+					options: options || ["Yes", "No"],
+					allowText: allowText ?? false,
+					timeout: timeoutMs,
+				});
+
+				// Wait for response with timeout
+				const response = await new Promise<string>((resolve, reject) => {
+					const timeout = setTimeout(() => {
+						agent.pendingQuestions.delete(requestId);
+						reject(new Error("User did not respond in time (60s timeout)"));
+					}, timeoutMs);
+
+					agent.pendingQuestions.set(requestId, {
+						requestId,
+						question,
+						options,
+						allowText,
+						resolve,
+						reject,
+						timeout,
+					});
+				});
+
+				return { userResponse: response };
+			},
+		});
+	}
+
+	// Handle chat via WebSocket (with ask_user support)
+	private async handleWebSocketChat(
+		connection: Connection,
+		message: string,
+		sessionId: string
+	): Promise<void> {
+		// Build system prompt with ask_user enabled
+		const entityContext = this.buildEntityContext(sessionId);
+		const systemPrompt = getSystemPrompt(this.state, true) + entityContext;
+
+		// All tools including ask_user
+		const allTools = {
+			...egdataTools,
+			propose_save_context: proposeSaveContextTool,
+			ask_user: this.createAskUserTool(connection),
+		};
+
+		// Get conversation history and add user message
+		const history = this.getConversationHistory(sessionId);
+		this.addMessage(sessionId, "user", message);
+
+		// Convert to model messages format
+		const modelMessages = [
+			...history.map((m) => ({
+				role: m.role as "user" | "assistant",
+				content: m.content,
+			})),
+			{ role: "user" as const, content: message },
+		];
+
+		const seenTools = new Set<string>();
+		const agent = this;
+
+		try {
+			const result = streamText({
+				model: google("gemini-3-flash-preview"),
+				system: systemPrompt,
+				messages: modelMessages,
+				tools: allTools,
+				stopWhen: stepCountIs(15),
+				// Gemini 3 thinking for better multi-step reasoning
+				providerOptions: {
+					google: {
+						thinkingConfig: {
+							thinkingLevel: "low", // Balance between speed and reasoning quality
+						},
+					} satisfies GoogleGenerativeAIProviderOptions,
+				},
+				// toolChoice: 'required' forces tool use - not needed as model handles this well
+				onStepFinish: async ({ toolCalls, toolResults }) => {
+					// Send tool progress events with dynamic descriptions
+					if (toolCalls) {
+						for (const tc of toolCalls) {
+							if (!seenTools.has(tc.toolName)) {
+								seenTools.add(tc.toolName);
+								// Access args from the tool call (may be 'args' or 'input' depending on SDK version)
+								const toolArgs =
+									"args" in tc
+										? (tc.args as ToolArgs)
+										: "input" in tc
+											? (tc.input as ToolArgs)
+											: {};
+								const description = getToolDescription(tc.toolName, toolArgs);
+								agent.sendToConnection(connection, {
+									type: "tool_progress",
+									tool: tc.toolName,
+									message: description,
+								});
+							}
+						}
+					}
+
+					// Extract entities from tool results
+					if (toolResults) {
+						for (const tr of toolResults) {
+							agent.extractAndSaveEntities(sessionId, tr.toolName, tr.output);
+
+							// Check for confirmation requests (propose_save_context)
+							if (tr.toolName === "propose_save_context") {
+								const output = tr.output as {
+									type?: string;
+									message?: string;
+									data?: {
+										country?: string;
+										language?: string;
+										fact?: string;
+									};
+								};
+								if (output?.type === "confirmation_required") {
+									agent.updateState({
+										pendingConfirmation: {
+											type: "save_context",
+											data: output.data || {},
+											message:
+												output.message || "Would you like me to remember this?",
+										},
+									});
+								}
+							}
+						}
+					}
+				},
+			});
+
+			let fullText = "";
+			for await (const chunk of result.textStream) {
+				fullText += chunk;
+				// Send text deltas for real-time display
+				this.sendToConnection(connection, { type: "text_delta", text: chunk });
+			}
+
+			// Send complete event
+			this.sendToConnection(connection, { type: "complete", text: fullText });
+
+			// Save assistant response
+			if (fullText.trim()) {
+				this.addMessage(sessionId, "assistant", fullText);
+			}
+		} catch (error) {
+			console.error("WebSocket chat error:", error);
+			this.sendToConnection(connection, {
+				type: "error",
+				message: error instanceof Error ? error.message : "Unknown error",
+			});
+		}
+	}
+
+	// ==========================================================================
+	// Database Helpers
+	// ==========================================================================
+
 	private getConversationHistory(sessionId: string, limit = 20): ChatMessage[] {
 		const rows = this.sql<ChatMessage>`
 			SELECT id, role, content, timestamp, session_id as sessionId
@@ -372,7 +612,6 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		return [...rows].reverse();
 	}
 
-	// Add message to conversation history (isolated per session)
 	private addMessage(
 		sessionId: string,
 		role: "user" | "assistant",
@@ -396,7 +635,6 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		return id;
 	}
 
-	// Update user state using Agent's built-in state management
 	private updateState(updates: Partial<UserState>) {
 		this.setState({
 			...this.state,
@@ -404,7 +642,6 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		});
 	}
 
-	// Get known entities for context (isolated per session)
 	private getKnownEntities(
 		sessionId: string
 	): Array<{ id: string; type: string; title: string }> {
@@ -417,7 +654,6 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		`;
 	}
 
-	// Save known entity (isolated per session)
 	private saveEntity(
 		sessionId: string,
 		id: string,
@@ -431,7 +667,6 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		`;
 	}
 
-	// Build entity context for system prompt (isolated per session)
 	private buildEntityContext(sessionId: string): string {
 		const entities = this.getKnownEntities(sessionId);
 		if (entities.length === 0) return "";
@@ -440,7 +675,6 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		return `\n\n## Known Entities (use these IDs for follow-up questions)\n${lines.join("\n")}`;
 	}
 
-	// Extract entities from tool results
 	private extractAndSaveEntities(
 		sessionId: string,
 		toolName: string,
@@ -449,22 +683,15 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		if (!result || typeof result !== "object") return;
 		const data = result as Record<string, unknown>;
 
-		// Handle search results
 		const searchResults = data.offers || data.hits || data.elements;
 		if (toolName === "search_offers" && Array.isArray(searchResults)) {
 			for (const hit of searchResults.slice(0, 3)) {
 				if (hit && typeof hit === "object" && "id" in hit && "title" in hit) {
-					this.saveEntity(
-						sessionId,
-						String(hit.id),
-						"offer",
-						String(hit.title)
-					);
+					this.saveEntity(sessionId, String(hit.id), "offer", String(hit.title));
 				}
 			}
 		}
 
-		// Handle single offer details
 		if (
 			(toolName === "get_offer_details" || toolName === "get_offer_price") &&
 			data.id &&
@@ -473,23 +700,21 @@ export class EGDataAgent extends Agent<Env, UserState> {
 			this.saveEntity(sessionId, String(data.id), "offer", String(data.title));
 		}
 
-		// Handle offer items
 		if (toolName === "get_offer_items" && Array.isArray(data)) {
 			for (const item of data.slice(0, 3)) {
 				if (item && typeof item === "object" && "id" in item && "title" in item) {
-					this.saveEntity(
-						sessionId,
-						String(item.id),
-						"item",
-						String(item.title)
-					);
+					this.saveEntity(sessionId, String(item.id), "item", String(item.title));
 				}
 			}
 		}
 	}
 
-	// Handle HTTP requests
-	async fetch(request: Request): Promise<Response> {
+	// ==========================================================================
+	// HTTP Handlers (kept for backward compatibility)
+	// Note: WebSocket upgrades are handled automatically by the Agents SDK
+	// ==========================================================================
+
+	override async onRequest(request: Request): Promise<Response> {
 		const url = new URL(request.url);
 
 		// Health check
@@ -507,28 +732,27 @@ export class EGDataAgent extends Agent<Env, UserState> {
 			return this.handleReject();
 		}
 
-		// Clear conversation (session-level only)
+		// Clear conversation
 		if (url.pathname === "/api/clear" && request.method === "POST") {
 			const body = (await request.json()) as { sessionId?: string };
 			const sessionId = body.sessionId || "default";
 			return this.handleClear(sessionId);
 		}
 
-		// Custom streaming endpoint for Discord bot (SSE format)
+		// SSE streaming endpoint (no ask_user support)
 		if (url.pathname === "/api/chat/stream" && request.method === "POST") {
 			return this.handleChatStream(request);
 		}
 
-		// Non-streaming chat endpoint
+		// Non-streaming chat endpoint (no ask_user support)
 		if (url.pathname === "/api/chat" && request.method === "POST") {
 			return this.handleChat(request);
 		}
 
-		// Unknown endpoint
 		return new Response("Not found", { status: 404 });
 	}
 
-	// Handle streaming chat with SSE format for Discord bot
+	// SSE streaming handler (kept for backward compatibility, no ask_user)
 	private async handleChatStream(request: Request): Promise<Response> {
 		const body = (await request.json()) as {
 			message: string;
@@ -541,12 +765,9 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		}
 
 		const sessionId = body.sessionId || "default";
-
-		// Build system prompt with user context and entity context
 		const entityContext = this.buildEntityContext(sessionId);
-		const systemPrompt = getSystemPrompt(this.state) + entityContext;
+		const systemPrompt = getSystemPrompt(this.state, false) + entityContext;
 
-		// All tools including the propose_save_context tool
 		const allTools = {
 			...egdataTools,
 			propose_save_context: proposeSaveContextTool,
@@ -556,13 +777,14 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		const encoder = new TextEncoder();
 		const seenTools = new Set<string>();
 
-		// Get conversation history and add user message
 		const history = this.getConversationHistory(sessionId);
 		this.addMessage(sessionId, "user", body.message);
 
-		// Convert to model messages format
 		const modelMessages = [
-			...history.map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
+			...history.map((m) => ({
+				role: m.role as "user" | "assistant",
+				content: m.content,
+			})),
 			{ role: "user" as const, content: body.message },
 		];
 
@@ -577,20 +799,30 @@ export class EGDataAgent extends Agent<Env, UserState> {
 						| undefined;
 
 					const result = streamText({
-						model: mistral("magistral-medium-2507"),
+						model: google("gemini-3-flash-preview"),
 						system: systemPrompt,
 						messages: modelMessages,
 						tools: allTools,
-						stopWhen: stepCountIs(10),
+						stopWhen: stepCountIs(15),
+						providerOptions: {
+							google: {
+								thinkingConfig: {
+									thinkingLevel: "low",
+								},
+							} satisfies GoogleGenerativeAIProviderOptions,
+						},
 						onStepFinish: async ({ toolCalls, toolResults }) => {
-							// Send tool progress events
 							if (toolCalls) {
 								for (const tc of toolCalls) {
 									if (!seenTools.has(tc.toolName)) {
 										seenTools.add(tc.toolName);
-										const description =
-											TOOL_DESCRIPTIONS[tc.toolName] ||
-											`Using ${tc.toolName}...`;
+										const toolArgs =
+											"args" in tc
+												? (tc.args as ToolArgs)
+												: "input" in tc
+													? (tc.input as ToolArgs)
+													: {};
+										const description = getToolDescription(tc.toolName, toolArgs);
 										controller.enqueue(
 											encoder.encode(
 												`data: ${JSON.stringify({
@@ -604,12 +836,10 @@ export class EGDataAgent extends Agent<Env, UserState> {
 								}
 							}
 
-							// Extract entities and check for confirmations from tool results
 							if (toolResults) {
 								for (const tr of toolResults) {
 									agent.extractAndSaveEntities(sessionId, tr.toolName, tr.output);
 
-									// Check for confirmation requests
 									if (tr.toolName === "propose_save_context") {
 										const output = tr.output as {
 											type?: string;
@@ -648,7 +878,6 @@ export class EGDataAgent extends Agent<Env, UserState> {
 						fullText += chunk;
 					}
 
-					// Send confirmation event if we have one
 					if (pendingConfirmation) {
 						controller.enqueue(
 							encoder.encode(
@@ -661,14 +890,12 @@ export class EGDataAgent extends Agent<Env, UserState> {
 						);
 					}
 
-					// Send complete event
 					controller.enqueue(
 						encoder.encode(
 							`data: ${JSON.stringify({ type: "complete", text: fullText })}\n\n`
 						)
 					);
 
-					// Save assistant response
 					if (fullText.trim()) {
 						agent.addMessage(sessionId, "assistant", fullText);
 					}
@@ -698,7 +925,7 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		});
 	}
 
-	// Handle non-streaming chat
+	// Non-streaming handler (kept for backward compatibility, no ask_user)
 	private async handleChat(request: Request): Promise<Response> {
 		const body = (await request.json()) as {
 			message: string;
@@ -711,53 +938,51 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		}
 
 		const sessionId = body.sessionId || "default";
-
-		// Build system prompt with user context and entity context
 		const entityContext = this.buildEntityContext(sessionId);
-		const systemPrompt = getSystemPrompt(this.state) + entityContext;
+		const systemPrompt = getSystemPrompt(this.state, false) + entityContext;
 
-		// All tools including the propose_save_context tool
 		const allTools = {
 			...egdataTools,
 			propose_save_context: proposeSaveContextTool,
 		};
 
-		// Get conversation history and add user message
 		const history = this.getConversationHistory(sessionId);
 		this.addMessage(sessionId, "user", body.message);
 
-		// Convert to model messages format
 		const modelMessages = [
-			...history.map((m) => ({ role: m.role as "user" | "assistant", content: m.content })),
+			...history.map((m) => ({
+				role: m.role as "user" | "assistant",
+				content: m.content,
+			})),
 			{ role: "user" as const, content: body.message },
 		];
 
 		try {
-			const { generateText } = await import("ai");
 			const result = await generateText({
-				model: mistral("magistral-medium-2507"),
+				model: google("gemini-3-flash-preview"),
 				system: systemPrompt,
 				messages: modelMessages,
 				tools: allTools,
-				stopWhen: stepCountIs(10),
+				stopWhen: stepCountIs(15),
+				providerOptions: {
+					google: {
+						thinkingConfig: {
+							thinkingLevel: "low",
+						},
+					} satisfies GoogleGenerativeAIProviderOptions,
+				},
 			});
 
 			const responseText = result.text;
 
-			// Extract entities from tool results
 			for (const step of result.steps) {
 				if (step.toolResults) {
 					for (const tr of step.toolResults) {
-						this.extractAndSaveEntities(
-							sessionId,
-							tr.toolName,
-							tr.output
-						);
+						this.extractAndSaveEntities(sessionId, tr.toolName, tr.output);
 					}
 				}
 			}
 
-			// Save assistant response
 			if (responseText.trim()) {
 				this.addMessage(sessionId, "assistant", responseText);
 			}
@@ -774,12 +999,14 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		}
 	}
 
-	// Handle confirmation of pending save
 	private handleConfirm(): Response {
 		const pending = this.state.pendingConfirmation;
 
 		if (!pending || pending.type !== "save_context") {
-			return Response.json({ error: "No pending confirmation" }, { status: 400 });
+			return Response.json(
+				{ error: "No pending confirmation" },
+				{ status: 400 }
+			);
 		}
 
 		const { country, language, fact } = pending.data;
@@ -803,7 +1030,6 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		});
 	}
 
-	// Handle rejection of pending save
 	private handleReject(): Response {
 		this.updateState({ pendingConfirmation: undefined });
 		return Response.json({
@@ -812,13 +1038,9 @@ export class EGDataAgent extends Agent<Env, UserState> {
 		});
 	}
 
-	// Handle clearing conversation (only clears session-level context, not user preferences)
 	private handleClear(sessionId: string): Response {
-		// Clear messages for this session
 		this.sql`DELETE FROM messages WHERE session_id = ${sessionId}`;
-		// Clear known entities for this session
 		this.sql`DELETE FROM known_entities WHERE session_id = ${sessionId}`;
 		return Response.json({ success: true });
 	}
 }
-
