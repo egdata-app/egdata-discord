@@ -746,6 +746,55 @@ export const egdataTools = {
 			apiRequest(`/offers/${offerId}/related`),
 	}),
 
+	get_offer_changelog: tool({
+		description:
+			"Get changelog/history of changes for a game offer. Shows what fields changed, when, and old/new values. " +
+			"Includes changes to the offer itself, related items, assets, and sandbox/namespace.",
+		inputSchema: z.object({
+			offerId: z.string().describe("The offer ID"),
+			limit: z.number().optional().describe("Results per page (default: 10)"),
+			page: z.number().optional().describe("Page number"),
+		}),
+		execute: async ({ offerId, limit, page }, _options: ToolOptions) =>
+			apiRequest(`/offers/${offerId}/changelog`, {
+				limit: String(limit || 10),
+				page: String(page || 1),
+			}),
+	}),
+
+	get_item_changelog: tool({
+		description:
+			"Get changelog/history of changes for an item (executable/entitlement). " +
+			"Shows changes to the item, related assets, and sandbox.",
+		inputSchema: z.object({
+			itemId: z.string().describe("The item ID"),
+			limit: z.number().optional().describe("Results per page (default: 10)"),
+			page: z.number().optional().describe("Page number"),
+		}),
+		execute: async ({ itemId, limit, page }, _options: ToolOptions) =>
+			apiRequest(`/items/${itemId}/changelog`, {
+				limit: String(limit || 10),
+				page: String(page || 1),
+			}),
+	}),
+
+	get_sandbox_changelog: tool({
+		description:
+			"Get changelog/history of changes for an entire sandbox/namespace. " +
+			"Shows all changes to offers, items, assets, and builds within the sandbox. " +
+			"Use this to track all updates for a game's entire ecosystem.",
+		inputSchema: z.object({
+			sandboxId: z.string().describe("The sandbox/namespace ID"),
+			limit: z.number().optional().describe("Results per page (default: 10)"),
+			page: z.number().optional().describe("Page number"),
+		}),
+		execute: async ({ sandboxId, limit, page }, _options: ToolOptions) =>
+			apiRequest(`/sandboxes/${sandboxId}/changelog`, {
+				limit: String(limit || 10),
+				page: String(page || 1),
+			}),
+	}),
+
 	search_items: tool({
 		description:
 			"Search for items (executables/entitlements) in the Epic Games Store. Items are what you actually download and run - the launcher entries. Use this to find specific executables, not game store listings (use search_offers for that). Items do NOT contain download size info.",
