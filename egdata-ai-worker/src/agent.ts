@@ -165,6 +165,48 @@ function getToolDescription(toolName: string, args: ToolArgs): string {
 		case "get_store_stats":
 			return "Getting store statistics...";
 
+		// Price tools
+		case "get_offer_price_stats":
+			return "Checking lowest price ever...";
+		case "get_offer_regional_prices":
+			return "Comparing regional prices...";
+
+		// Giveaway & media
+		case "get_offer_giveaways":
+			return "Checking giveaway history...";
+		case "get_offer_media":
+			return "Loading screenshots & videos...";
+		case "get_offer_technologies":
+			return "Checking game technologies...";
+
+		// Seller tools
+		case "get_seller_offers": {
+			const sellerId = args.sellerId as string | undefined;
+			return sellerId
+				? `Loading publisher games [${sellerId.slice(0, 8)}...]`
+				: "Loading publisher games...";
+		}
+		case "get_seller_stats":
+			return "Getting publisher statistics...";
+
+		// Events
+		case "get_events":
+			return "Finding active events & sales...";
+		case "get_event_offers": {
+			const eventId = args.eventId as string | undefined;
+			return eventId
+				? `Loading event games [${truncate(eventId, 20)}]...`
+				: "Loading event games...";
+		}
+
+		// Free games search
+		case "search_free_games": {
+			const freeQuery = args.query as string | undefined;
+			return freeQuery
+				? `Searching giveaways for "${truncate(freeQuery)}"...`
+				: "Searching past giveaways...";
+		}
+
 		// Human-in-the-loop
 		case "propose_save_context":
 			return "Preparing to remember...";

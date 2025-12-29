@@ -282,44 +282,85 @@ async function apiRequest(
 export const egdataTools = {
 	search_offers: tool({
 		description:
-			"Search for games in Epic Games Store by name. Returns offer IDs needed for other tools. " +
+			"Search for games in Epic Games Store with powerful filters. Returns offer IDs needed for other tools. " +
 			"IMPORTANT: Use offerType='BASE_GAME' for prices/sizes (not DLC/editions). " +
-			"PARALLEL TIP: When comparing multiple games (e.g., 'Cyberpunk vs Witcher'), make SEPARATE search calls for each game in the SAME step. " +
+			"KEY FILTERS: seller (publisher games), onSale (discounts), pastGiveaways (previously free), price range, tags. " +
+			"PARALLEL TIP: When comparing multiple games, make SEPARATE search calls in the SAME step. " +
 			"NEXT STEP: After getting IDs, call get_offer_price or get_offer_prices for pricing.",
 		inputSchema: z.object({
-			query: z.string().optional().describe("Game title to search"),
+			query: z.string().optional().describe("Game title to search (full-text search across title, developer, publisher, tags, description)"),
 			offerType: z
-				.string()
+				.enum(["BASE_GAME", "DLC", "BUNDLE", "ADD_ON", "EDITION", "IN_GAME_PURCHASE", "EXPERIENCE", "UNLOCKABLE", "CONSUMABLE", "WALLET", "DEMO", "VIRTUAL_CURRENCY", "DIGITAL_EXTRA", "OTHERS"])
 				.optional()
-				.describe(
-					"Filter: BASE_GAME, DLC, BUNDLE, ADD_ON, EDITION. Use BASE_GAME for accurate prices/sizes."
-				),
+				.describe("Filter by offer type. Use BASE_GAME for accurate prices/sizes."),
+			seller: z.string().optional().describe("Filter by seller/publisher ID or name (e.g., 'Ubisoft', 'Electronic Arts')"),
+			developerDisplayName: z.string().optional().describe("Filter by exact developer name"),
+			publisherDisplayName: z.string().optional().describe("Filter by exact publisher name"),
+			tags: z.array(z.string()).optional().describe("Filter by tag IDs (must match ALL tags)"),
+			categories: z.array(z.string()).optional().describe("Filter by category names (must match ALL categories)"),
+			onSale: z.boolean().optional().describe("Set to true to only show games with active discounts"),
+			pastGiveaways: z.boolean().optional().describe("Set to true to only show games that were previously given away for free"),
+			isLowestPrice: z.boolean().optional().describe("Set to true to only show games currently at their lowest historical price"),
+			priceMin: z.number().optional().describe("Minimum price in cents (e.g., 1000 = $10.00)"),
+			priceMax: z.number().optional().describe("Maximum price in cents (e.g., 2000 = $20.00). Use 0 to find free games."),
+			excludeBlockchain: z.boolean().optional().describe("Set to true to exclude blockchain/NFT games"),
+			isCodeRedemptionOnly: z.boolean().optional().describe("Filter by code redemption only games"),
 			sortBy: z
-				.string()
+				.enum(["releaseDate", "lastModifiedDate", "effectiveDate", "creationDate", "viewableDate", "pcReleaseDate", "upcoming", "priceAsc", "priceDesc", "price", "discount", "discountPercent", "giveawayDate"])
 				.optional()
-				.describe("Sort: releaseDate, lastModifiedDate, price, discount"),
-			sortDir: z.string().optional().describe("asc or desc"),
+				.describe("Sort field. Use 'discount' or 'discountPercent' for best deals, 'giveawayDate' for past giveaways, 'upcoming' for future releases."),
+			sortDir: z.enum(["asc", "desc"]).optional().describe("Sort direction (default: desc)"),
 			limit: z.number().optional().describe("Results per page (max 10)"),
 			page: z.number().optional().describe("Page number. For 'top 20', call page=1 AND page=2 in parallel."),
-			country: z
-				.string()
-				.optional()
-				.describe("Country code (US, GB, DE, etc.)"),
+			country: z.string().optional().describe("Country code (US, GB, DE, etc.) for regional pricing"),
 		}),
 		execute: async (args, _options: ToolOptions) => {
 			const body: Record<string, unknown> = {};
+
+			// Text search
 			if (args.query) body.title = args.query;
+
+			// Offer type filter
 			if (args.offerType) body.offerType = args.offerType;
+
+			// Seller/developer/publisher filters
+			if (args.seller) body.seller = args.seller;
+			if (args.developerDisplayName) body.developerDisplayName = args.developerDisplayName;
+			if (args.publisherDisplayName) body.publisherDisplayName = args.publisherDisplayName;
+
+			// Tag and category filters
+			if (args.tags && args.tags.length > 0) body.tags = args.tags;
+			if (args.categories && args.categories.length > 0) body.categories = args.categories;
+
+			// Boolean filters
+			if (args.onSale !== undefined) body.onSale = args.onSale;
+			if (args.pastGiveaways !== undefined) body.pastGiveaways = args.pastGiveaways;
+			if (args.isLowestPrice !== undefined) body.isLowestPrice = args.isLowestPrice;
+			if (args.excludeBlockchain !== undefined) body.excludeBlockchain = args.excludeBlockchain;
+			if (args.isCodeRedemptionOnly !== undefined) body.isCodeRedemptionOnly = args.isCodeRedemptionOnly;
+
+			// Price range filter
+			if (args.priceMin !== undefined || args.priceMax !== undefined) {
+				body.price = {};
+				if (args.priceMin !== undefined) (body.price as Record<string, number>).min = args.priceMin;
+				if (args.priceMax !== undefined) (body.price as Record<string, number>).max = args.priceMax;
+			}
+
+			// Sorting
 			if (args.sortBy) body.sortBy = args.sortBy;
 			if (args.sortDir) body.sortDir = args.sortDir;
-			// Limit results to avoid token overflow
+
+			// Pagination - limit results to avoid token overflow
 			const limitNum = Math.min(args.limit || 5, 10);
 			body.limit = limitNum;
 			const pageNum = args.page || 1;
 			body.page = pageNum;
-			if (args.country) body.country = args.country;
 
-			const response = await fetch(`${API_BASE}/search/v2/search`, {
+			// Build URL with country param
+			const url = new URL(`${API_BASE}/search/v2/search`);
+			if (args.country) url.searchParams.set("country", args.country);
+
+			const response = await fetch(url.toString(), {
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
 				body: JSON.stringify(body),
@@ -449,6 +490,62 @@ export const egdataTools = {
 		},
 	}),
 
+	get_offer_price_stats: tool({
+		description:
+			"Get price statistics for a game: current price, lowest price EVER, and last discount price. " +
+			"Use for 'what's the lowest this game has been?' or 'is this a good deal?' questions. " +
+			"Returns pre-formatted prices for easy comparison.",
+		inputSchema: z.object({
+			offerId: z.string().describe("Offer ID from search_offers"),
+			country: z
+				.string()
+				.optional()
+				.describe("Country code (default: US). MUST use user's country if set."),
+		}),
+		execute: async ({ offerId, country }, _options: ToolOptions) => {
+			const data = await apiRequest(`/offers/${offerId}/price-stats`, {
+				country: country || "US",
+			});
+			return addFormattedPrices(data);
+		},
+	}),
+
+	get_offer_regional_prices: tool({
+		description:
+			"Get prices for a game across ALL regions. Shows which country has the cheapest price. " +
+			"Use for 'which region is cheapest?' or regional price comparison questions. " +
+			"Returns prices for multiple regions with currency conversion.",
+		inputSchema: z.object({
+			offerId: z.string().describe("Offer ID from search_offers"),
+		}),
+		execute: async ({ offerId }, _options: ToolOptions) => {
+			const data = await apiRequest(`/offers/${offerId}/regional-price`);
+			return addFormattedPrices(data);
+		},
+	}),
+
+	get_offer_giveaways: tool({
+		description:
+			"Get giveaway history for a game - when it was free in the past and any upcoming free periods. " +
+			"Use for 'when was this game free?' or 'will it be free again?' questions.",
+		inputSchema: z.object({
+			offerId: z.string().describe("Offer ID from search_offers"),
+		}),
+		execute: async ({ offerId }, _options: ToolOptions) =>
+			apiRequest(`/offers/${offerId}/giveaways`),
+	}),
+
+	get_offer_media: tool({
+		description:
+			"Get media assets for a game including screenshots, videos, and artwork. " +
+			"Returns URLs to images and video content.",
+		inputSchema: z.object({
+			offerId: z.string().describe("Offer ID from search_offers"),
+		}),
+		execute: async ({ offerId }, _options: ToolOptions) =>
+			apiRequest(`/offers/${offerId}/media`),
+	}),
+
 	get_free_games: tool({
 		description:
 			"Get currently free games on Epic Games Store (PC and mobile). " +
@@ -539,6 +636,56 @@ export const egdataTools = {
 				publishers: data.slice(0, 50),
 				totalPublishers: data.length,
 				_note: "Showing top 50 publishers by giveaway count. Use query parameter to search for specific publishers.",
+			};
+		},
+	}),
+
+	search_free_games: tool({
+		description:
+			"Search past free game giveaways by title, type, tags, or categories. " +
+			"Use for 'was X ever free?' or 'what RPGs were given away?' questions. " +
+			"Different from get_free_games_history which just lists chronologically.",
+		inputSchema: z.object({
+			query: z.string().optional().describe("Search by game title"),
+			offerType: z
+				.enum(["BASE_GAME", "DLC", "BUNDLE", "ADD_ON", "EDITION"])
+				.optional()
+				.describe("Filter by offer type"),
+			tags: z.array(z.string()).optional().describe("Filter by tag IDs"),
+			categories: z.array(z.string()).optional().describe("Filter by category names"),
+			sortBy: z
+				.enum(["giveawayDate", "releaseDate", "title"])
+				.optional()
+				.describe("Sort field (default: giveawayDate)"),
+			sortDir: z.enum(["asc", "desc"]).optional().describe("Sort direction (default: desc)"),
+			limit: z.number().optional().describe("Results per page (default: 10, max: 25)"),
+			page: z.number().optional().describe("Page number"),
+		}),
+		execute: async ({ query, offerType, tags, categories, sortBy, sortDir, limit, page }, _options: ToolOptions) => {
+			const params: Record<string, string> = {};
+			if (query) params.query = query;
+			if (offerType) params.offerType = offerType;
+			if (tags && tags.length > 0) params.tags = tags.join(",");
+			if (categories && categories.length > 0) params.categories = categories.join(",");
+			if (sortBy) params.sortBy = sortBy;
+			if (sortDir) params.sortDir = sortDir;
+			params.limit = String(Math.min(limit || 10, 25));
+			params.page = String(page || 1);
+
+			const result = await apiRequest("/free-games/search", params);
+			const elements = (result as { elements?: unknown[]; hits?: unknown[] })?.elements ||
+				(result as { hits?: unknown[] })?.hits || [];
+			const pageNum = page || 1;
+			const limitNum = Math.min(limit || 10, 25);
+
+			return {
+				...result as object,
+				_pagination: {
+					currentPage: pageNum,
+					resultsOnPage: elements.length,
+					hasMore: elements.length === limitNum,
+					nextPage: elements.length === limitNum ? pageNum + 1 : null,
+				},
 			};
 		},
 	}),
@@ -695,10 +842,115 @@ export const egdataTools = {
 			apiRequest("/multisearch/sellers", { query }),
 	}),
 
+	get_seller_offers: tool({
+		description:
+			"Get all games/offers from a specific seller/publisher. " +
+			"Use after search_sellers to get the seller ID. " +
+			"Supports filtering by offer type and pagination.",
+		inputSchema: z.object({
+			sellerId: z.string().describe("Seller ID from search_sellers"),
+			offerType: z
+				.enum(["BASE_GAME", "DLC", "BUNDLE", "ADD_ON", "EDITION", "OTHERS"])
+				.optional()
+				.describe("Filter by offer type"),
+			country: z.string().optional().describe("Country code for pricing (default: US)"),
+			limit: z.number().optional().describe("Results per page (default: 10, max: 25)"),
+			page: z.number().optional().describe("Page number"),
+		}),
+		execute: async ({ sellerId, offerType, country, limit, page }, _options: ToolOptions) => {
+			const params: Record<string, string> = {};
+			if (offerType) params.offerType = offerType;
+			if (country) params.country = country;
+			params.limit = String(Math.min(limit || 10, 25));
+			params.page = String(page || 1);
+
+			const result = await apiRequest(`/sellers/${sellerId}`, params);
+			const elements = (result as { elements?: unknown[] })?.elements || [];
+			const pageNum = page || 1;
+			const limitNum = Math.min(limit || 10, 25);
+
+			return {
+				...result as object,
+				_pagination: {
+					currentPage: pageNum,
+					resultsOnPage: elements.length,
+					hasMore: elements.length === limitNum,
+					nextPage: elements.length === limitNum ? pageNum + 1 : null,
+				},
+			};
+		},
+	}),
+
+	get_seller_stats: tool({
+		description:
+			"Get statistics for a seller/publisher: total offers, items, base games, and free promotions count.",
+		inputSchema: z.object({
+			sellerId: z.string().describe("Seller ID from search_sellers"),
+		}),
+		execute: async ({ sellerId }, _options: ToolOptions) =>
+			apiRequest(`/sellers/${sellerId}/stats`),
+	}),
+
 	get_promotions: tool({
 		description: "Get active promotional events and sales on Epic Games Store.",
 		inputSchema: z.object({}),
 		execute: async (_args, _options: ToolOptions) => apiRequest("/promotions"),
+	}),
+
+	get_events: tool({
+		description:
+			"Get all active event tags (sales, themed collections, special events) on Epic Games Store. " +
+			"Returns event IDs needed for get_event_offers. " +
+			"Use for 'what sales are happening?' or 'what events are active?' questions.",
+		inputSchema: z.object({}),
+		execute: async (_args, _options: ToolOptions) =>
+			apiRequest("/offers/events"),
+	}),
+
+	get_event_offers: tool({
+		description:
+			"Get all games/offers in a specific event or sale. " +
+			"Use after get_events to get event ID. " +
+			"Supports filtering, sorting, and pagination.",
+		inputSchema: z.object({
+			eventId: z.string().describe("Event ID from get_events"),
+			offerType: z
+				.enum(["BASE_GAME", "DLC", "BUNDLE", "ADD_ON", "EDITION", "OTHERS"])
+				.optional()
+				.describe("Filter by offer type"),
+			sortBy: z
+				.enum(["releaseDate", "lastModifiedDate", "price", "discount", "discountPercent", "title"])
+				.optional()
+				.describe("Sort field"),
+			sortDir: z.enum(["asc", "desc"]).optional().describe("Sort direction"),
+			country: z.string().optional().describe("Country code for pricing (default: US)"),
+			limit: z.number().optional().describe("Results per page (default: 10, max: 25)"),
+			page: z.number().optional().describe("Page number"),
+		}),
+		execute: async ({ eventId, offerType, sortBy, sortDir, country, limit, page }, _options: ToolOptions) => {
+			const params: Record<string, string> = {};
+			if (offerType) params.offerType = offerType;
+			if (sortBy) params.sortBy = sortBy;
+			if (sortDir) params.sortDir = sortDir;
+			if (country) params.country = country;
+			params.limit = String(Math.min(limit || 10, 25));
+			params.page = String(page || 1);
+
+			const result = await apiRequest(`/offers/events/${eventId}`, params);
+			const elements = (result as { elements?: unknown[] })?.elements || [];
+			const pageNum = page || 1;
+			const limitNum = Math.min(limit || 10, 25);
+
+			return {
+				...result as object,
+				_pagination: {
+					currentPage: pageNum,
+					resultsOnPage: elements.length,
+					hasMore: elements.length === limitNum,
+					nextPage: elements.length === limitNum ? pageNum + 1 : null,
+				},
+			};
+		},
 	}),
 
 	get_store_stats: tool({
@@ -709,7 +961,11 @@ export const egdataTools = {
 	}),
 
 	get_offer_achievements: tool({
-		description: "Get achievement information for a game.",
+		description:
+			"Get achievements/trophies for a game including names, descriptions, XP values, and unlock rarity (completedPercent). " +
+			"Returns achievement sets with each achievement's unlockedDisplayName, unlockedDescription, xp, completedPercent (lower = rarer), and hidden status. " +
+			"IMPORTANT: If the response contains an achievement set but the 'achievements' array is empty, it means achievements ARE registered in Epic's backend but NOT YET PUBLISHED/visible. " +
+			"Use for 'what achievements does X have?' or 'how many achievements?' or 'hardest achievements?' questions.",
 		inputSchema: z.object({
 			offerId: z.string().describe("The offer ID"),
 		}),
@@ -744,6 +1000,18 @@ export const egdataTools = {
 		}),
 		execute: async ({ offerId }, _options: ToolOptions) =>
 			apiRequest(`/offers/${offerId}/related`),
+	}),
+
+	get_offer_technologies: tool({
+		description:
+			"Get technologies and middleware used by a game (extracted from game files). " +
+			"Returns SDKs, graphics tech (DLSS, FSR, XeSS), APIs (DirectStorage), peripherals (Razer Chroma, iCue), video codecs, etc. " +
+			"Use for questions like 'Does this game support DLSS?' or 'What technologies does X use?'",
+		inputSchema: z.object({
+			offerId: z.string().describe("The offer ID"),
+		}),
+		execute: async ({ offerId }, _options: ToolOptions) =>
+			apiRequest(`/offers/${offerId}/technologies`),
 	}),
 
 	get_offer_changelog: tool({
