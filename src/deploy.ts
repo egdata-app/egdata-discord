@@ -10,7 +10,7 @@ const commandsFolder = path.join(__dirname, 'commands');
 
 const commandFiles = fs
   .readdirSync(commandsFolder)
-  .filter((file) => file.endsWith('.js'));
+  .filter((file) => file.endsWith('.ts'));
 
 for (const file of commandFiles) {
   const commandPath = path.join(commandsFolder, file);
