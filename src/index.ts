@@ -12,8 +12,10 @@ import {
   ButtonInteraction,
   ChannelType,
   inlineCode,
+  REST,
+  Routes,
 } from 'discord.js';
-import { token, healthCheckPort } from './config.js';
+import { token, healthCheckPort, clientId } from './config.js';
 import { fileURLToPath } from 'node:url';
 import { Command } from './types/command.js';
 import { setupHealthCheckServer } from './utils/healthCheck.js';
@@ -21,6 +23,8 @@ import { logger } from './utils/logger.js';
 import consola from 'consola';
 import { client as apiClient } from './utils/client.js';
 import { threadSessions, sessionThreadTitles, extractThreadTitle, AI_WORKER_URL, pendingAskUserRequests } from './commands/ask.js';
+
+const IS_DEV = process.env['DEV_MODE'] === 'true';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -45,13 +49,15 @@ client.commands = new Collection<string, Command>();
 
 // Load commands
 async function loadCommands() {
+  // In dev mode, we're running from src/, in prod from dist/
+  const ext = IS_DEV ? '.ts' : '.js';
   const commandsFolder = path.join(__dirname, 'commands');
-  logger.info(`Loading commands from ${commandsFolder}`);
+  logger.info(`Loading commands from ${commandsFolder} (ext: ${ext})`);
 
   try {
     const commandFiles = fs
       .readdirSync(commandsFolder)
-      .filter((file) => file.endsWith('.js'));
+      .filter((file) => file.endsWith(ext));
 
     for (const file of commandFiles) {
       const commandPath = path.join(commandsFolder, file);
@@ -70,6 +76,96 @@ async function loadCommands() {
     logger.error('Failed to load commands:', error);
     throw error;
   }
+}
+
+// Deploy commands to Discord
+async function deployCommands() {
+  const ext = IS_DEV ? '.ts' : '.js';
+  const commandsFolder = path.join(__dirname, 'commands');
+  const commands: any[] = [];
+
+  const commandFiles = fs
+    .readdirSync(commandsFolder)
+    .filter((file) => file.endsWith(ext));
+
+  for (const file of commandFiles) {
+    const commandPath = path.join(commandsFolder, file);
+    const command = await import(`file://${commandPath}?t=${Date.now()}`).then(
+      (module) => module.default
+    );
+
+    if ('data' in command && ('execute' in command || 'autocomplete' in command)) {
+      const data = command.data.toJSON();
+      commands.push({
+        ...data,
+        integration_types: [0, 1],
+        contexts: [0, 1, 2],
+      });
+    }
+  }
+
+  const rest = new REST().setToken(token);
+  await rest.put(Routes.applicationCommands(clientId), { body: commands });
+  logger.info(`Deployed ${commands.length} commands to Discord`);
+}
+
+// Hot reload a single command (dev mode only)
+async function reloadCommand(filename: string) {
+  const commandPath = path.join(__dirname, 'commands', filename);
+
+  try {
+    // Import with cache-busting timestamp
+    const command = await import(`file://${commandPath}?t=${Date.now()}`).then(
+      (module) => module.default
+    );
+
+    if ('data' in command && ('execute' in command || 'autocomplete' in command)) {
+      client.commands.set(command.data.name, command);
+      logger.info(`🔄 Hot-reloaded command: ${command.data.name}`);
+      return command;
+    } else {
+      logger.error(`Invalid command structure in ${filename}`);
+      return null;
+    }
+  } catch (error) {
+    logger.error(`Failed to reload command ${filename}:`, error);
+    return null;
+  }
+}
+
+// Watch commands folder for changes (dev mode only)
+function watchCommands() {
+  const commandsFolder = path.join(__dirname, 'commands');
+  logger.info(`👀 Watching commands folder for changes: ${commandsFolder}`);
+
+  // Debounce map to prevent multiple reloads for the same file
+  const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+  fs.watch(commandsFolder, async (_eventType, filename) => {
+    if (!filename || !filename.endsWith('.ts')) return;
+
+    // Debounce: wait 100ms before reloading to handle rapid file changes
+    const existingTimer = debounceTimers.get(filename);
+    if (existingTimer) clearTimeout(existingTimer);
+
+    debounceTimers.set(filename, setTimeout(async () => {
+      debounceTimers.delete(filename);
+
+      logger.info(`📝 Detected change in ${filename}`);
+
+      const command = await reloadCommand(filename);
+      if (command) {
+        // Re-deploy all commands to Discord
+        // Note: Discord has rate limits, so we deploy all at once rather than individually
+        try {
+          await deployCommands();
+          logger.info(`✅ Commands deployed to Discord`);
+        } catch (error) {
+          logger.error('Failed to deploy commands to Discord:', error);
+        }
+      }
+    }, 100));
+  });
 }
 
 // Handle command execution
@@ -129,23 +225,36 @@ client.once(Events.ClientReady, async (readyClient) => {
       const activeThreads = await guild.channels.fetchActiveThreads();
 
       let joinedCount = 0;
+      let recoveredCount = 0;
       for (const thread of activeThreads.threads.values()) {
-        // Only join threads created by the bot
+        // Only process threads created by the bot
         if (thread.ownerId !== readyClient.user.id) {
           continue;
         }
 
-        try {
-          await thread.join();
-          joinedCount++;
-          logger.debug(`Joined thread: ${thread.name} (${thread.id})`);
-        } catch {
-          // Ignore errors (bot might not have permission or already joined)
+        // Join if not already a member
+        if (!thread.joined) {
+          try {
+            await thread.join();
+            joinedCount++;
+            logger.debug(`Joined thread: ${thread.name} (${thread.id})`);
+          } catch {
+            // Ignore errors (bot might not have permission)
+            continue;
+          }
+        }
+
+        // Proactively recover session if not in memory
+        if (!threadSessions.has(thread.id)) {
+          const recovered = await recoverThreadSession(thread);
+          if (recovered) {
+            recoveredCount++;
+          }
         }
       }
 
-      if (joinedCount > 0) {
-        logger.info(`Joined ${joinedCount} bot-created threads in ${guild.name}`);
+      if (joinedCount > 0 || recoveredCount > 0) {
+        logger.info(`${guild.name}: joined ${joinedCount} threads, recovered ${recoveredCount} sessions`);
       }
     }
   } catch (error) {
@@ -435,8 +544,8 @@ client.on(Events.MessageCreate, async (message) => {
 
     consola.trace('Message created:', message.content);
 
-    // Handle AI chat in threads
-    if (message.channel.isThread() && !message.author.bot) {
+    // Handle AI chat in threads (only for bot-owned threads)
+    if (message.channel.isThread() && !message.author.bot && message.channel.ownerId === client.user?.id) {
       logger.debug(`Thread message received in ${message.channel.id}: ${message.content.slice(0, 50)}...`);
 
       let sessionId: string | undefined = threadSessions.get(message.channel.id);
@@ -692,6 +801,14 @@ process.on('SIGINT', async () => {
 async function initialize() {
   try {
     await loadCommands();
+
+    // In dev mode, deploy commands on startup and watch for changes
+    if (IS_DEV) {
+      logger.info('🛠️  Dev mode enabled');
+      await deployCommands();
+      watchCommands();
+    }
+
     setupHealthCheckServer(client, healthCheckPort);
     await client.login(token);
   } catch (error) {
