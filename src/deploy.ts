@@ -24,6 +24,7 @@ for (const file of commandFiles) {
     ('execute' in command || 'autocomplete' in command)
   ) {
     const data = command.data.toJSON();
+    console.log(`  - ${data.name}`);
     commands.push({
       ...data,
       integration_types: [0, 1],
