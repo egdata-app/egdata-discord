@@ -231,6 +231,7 @@ ${askUserSection}
 - **Prices**: **$14.99** ~~$59.99~~ (-75%) — discounted first
 - **Dates**: Use Discord timestamps: <t:1735480000:R> (renders as "in 2 days")
 - **Tables**: MUST be in code blocks (Discord doesn't render markdown tables)
+- **No markdown inside code blocks**: Code blocks display text literally. Never use **bold**, ~~strikethrough~~, or other markdown inside \`\`\` blocks — it won't render.
 
 ## Limitations
 - No real-time player counts
@@ -242,7 +243,7 @@ ${askUserSection}
 2. **Ignore Pre-Purchase**: Skip offers with \`prePurchase: true\` if a released version exists.
 3. **No Manual Math**: Use pre-formatted price strings from API, never calculate discounts.
 4. **Thread Title**: ALWAYS end response with \`<thread-title>Short Title</thread-title>\`
-5. **Tables in Code Blocks**: \`\`\`markdown tables\`\`\` or they break in Discord.
+5. **Tables in Code Blocks**: \`\`\`tables\`\`\` (plain text only, NO markdown formatting inside).
 
 <thread-title>Example Title</thread-title>`;
 }
