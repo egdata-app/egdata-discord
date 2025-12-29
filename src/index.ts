@@ -4,6 +4,7 @@ import {
   Client,
   Events,
   GatewayIntentBits,
+  Partials,
   Collection,
   ActivityType,
   ChatInputCommandInteraction,
@@ -31,6 +32,11 @@ const client = new Client({
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.DirectMessages,
     GatewayIntentBits.GuildMessageReactions,
+  ],
+  partials: [
+    Partials.Channel, // Required to receive events from uncached channels/threads
+    Partials.Message, // Required to receive events from uncached messages
+    Partials.ThreadMember, // Required to receive events from threads after restart
   ],
 });
 
@@ -112,9 +118,39 @@ async function handleAutocomplete(interaction: AutocompleteInteraction) {
 }
 
 // Event handlers
-client.once(Events.ClientReady, (readyClient) => {
+client.once(Events.ClientReady, async (readyClient) => {
   logger.info(`Logged in as ${readyClient.user.tag}`);
   client.user?.setActivity('EGS changes...', { type: ActivityType.Watching });
+
+  // Join active threads created by the bot to receive messages after restart
+  try {
+    for (const guild of readyClient.guilds.cache.values()) {
+      // Fetch active threads in the guild
+      const activeThreads = await guild.channels.fetchActiveThreads();
+
+      let joinedCount = 0;
+      for (const thread of activeThreads.threads.values()) {
+        // Only join threads created by the bot
+        if (thread.ownerId !== readyClient.user.id) {
+          continue;
+        }
+
+        try {
+          await thread.join();
+          joinedCount++;
+          logger.debug(`Joined thread: ${thread.name} (${thread.id})`);
+        } catch {
+          // Ignore errors (bot might not have permission or already joined)
+        }
+      }
+
+      if (joinedCount > 0) {
+        logger.info(`Joined ${joinedCount} bot-created threads in ${guild.name}`);
+      }
+    }
+  } catch (error) {
+    logger.error('Error joining active threads:', error);
+  }
 });
 
 client.on(Events.InteractionCreate, async (interaction) => {
@@ -167,9 +203,9 @@ async function handleButton(interaction: ButtonInteraction) {
         components: [],
       });
 
-      // Send welcome message in thread
+      // Send welcome message in thread (include session ID for recovery after bot restart)
       await thread.send({
-        content: `💬 **Chat started!** Just type your messages here and I'll respond. Your conversation context is preserved from the original question.`,
+        content: `💬 **Chat started!** Just type your messages here and I'll respond. Your conversation context is preserved from the original question.\n-# Session: \`${sessionId}\``,
       });
 
       logger.info(`Created AI chat thread ${thread.id} for session ${sessionId}`);
@@ -351,16 +387,72 @@ async function processEpicGamesUrl(message: string) {
   return null;
 }
 
+// Try to recover session ID from thread's welcome message (for bot restarts)
+async function recoverThreadSession(thread: import('discord.js').ThreadChannel): Promise<string | null> {
+  try {
+    // Fetch messages from the START of the thread (after: thread.id gets oldest messages first)
+    // Thread ID is also the ID of the starter message, so fetching after it gets the first messages
+    const messages = await thread.messages.fetch({ after: thread.id, limit: 10 });
+
+    logger.debug(`Fetched ${messages.size} messages from thread ${thread.id} for recovery`);
+
+    // Look for the bot's welcome message containing the session ID
+    for (const msg of messages.values()) {
+      logger.debug(`Checking message from ${msg.author.tag}: ${msg.content.slice(0, 100)}...`);
+      if (msg.author.id === client.user?.id) {
+        // Match the session ID pattern - with or without backticks
+        // Format: Session: `discord-{userId}-{timestamp}-{random}` or Session: discord-...
+        const match = msg.content.match(/Session:\s*`?(discord-\d+-[a-z0-9]+-[a-z0-9]+)`?/);
+        if (match?.[1]) {
+          logger.info(`Recovered session ${match[1]} for thread ${thread.id}`);
+          threadSessions.set(thread.id, match[1]);
+          return match[1];
+        }
+      }
+    }
+
+    logger.debug(`No session ID found in thread ${thread.id} messages`);
+  } catch (error) {
+    logger.error(`Failed to recover session for thread ${thread.id}:`, error);
+  }
+  return null;
+}
+
 client.on(Events.MessageCreate, async (message) => {
   try {
+    // Debug: Log ALL incoming messages to verify event is firing
+    logger.debug(`MessageCreate: channel=${message.channel.id} type=${message.channel.type} isThread=${message.channel.isThread()} author=${message.author?.tag || 'unknown'}`);
+
+    // Handle partial messages (from uncached channels after restart)
+    if (message.partial) {
+      try {
+        await message.fetch();
+      } catch {
+        logger.warn('Failed to fetch partial message');
+        return;
+      }
+    }
+
     consola.trace('Message created:', message.content);
 
     // Handle AI chat in threads
     if (message.channel.isThread() && !message.author.bot) {
-      const sessionId = threadSessions.get(message.channel.id);
+      logger.debug(`Thread message received in ${message.channel.id}: ${message.content.slice(0, 50)}...`);
+
+      let sessionId: string | undefined = threadSessions.get(message.channel.id);
+
+      // If session not in memory, try to recover it from the thread's welcome message
+      if (!sessionId) {
+        logger.debug(`Session not in memory for thread ${message.channel.id}, attempting recovery...`);
+        const recovered = await recoverThreadSession(message.channel);
+        if (recovered) sessionId = recovered;
+      }
+
       if (sessionId) {
         await handleThreadMessage(message, sessionId);
         return;
+      } else {
+        logger.debug(`No session found for thread ${message.channel.id}, ignoring message`);
       }
     }
 
@@ -476,18 +568,61 @@ async function handleThreadMessage(message: import('discord.js').Message, sessio
     // Strip thread title from response
     const { cleanContent } = extractThreadTitle(fullText);
 
-    // Discord message limit is 2000 characters
+    // Discord message limit is 2000 characters - split into multiple messages for threads
     const MAX_LENGTH = 1900;
-    let responseText = cleanContent;
 
-    if (responseText.length > MAX_LENGTH) {
-      responseText = responseText.slice(0, MAX_LENGTH) + '...';
+    if (cleanContent.length <= MAX_LENGTH) {
+      await message.reply({
+        content: cleanContent,
+        allowedMentions: { repliedUser: false },
+      });
+    } else {
+      // Split into multiple messages at natural break points
+      const chunks: string[] = [];
+      let remaining = cleanContent;
+
+      while (remaining.length > 0) {
+        if (remaining.length <= MAX_LENGTH) {
+          chunks.push(remaining);
+          break;
+        }
+
+        // Find a good break point (paragraph, line, or space)
+        let breakPoint = MAX_LENGTH;
+        const searchRegion = remaining.slice(MAX_LENGTH - 300, MAX_LENGTH);
+
+        // Priority: double newline > single newline > space
+        const paragraphBreak = searchRegion.lastIndexOf('\n\n');
+        if (paragraphBreak !== -1) {
+          breakPoint = MAX_LENGTH - 300 + paragraphBreak + 2;
+        } else {
+          const lineBreak = searchRegion.lastIndexOf('\n');
+          if (lineBreak !== -1) {
+            breakPoint = MAX_LENGTH - 300 + lineBreak + 1;
+          } else {
+            const space = searchRegion.lastIndexOf(' ');
+            if (space !== -1) {
+              breakPoint = MAX_LENGTH - 300 + space + 1;
+            }
+          }
+        }
+
+        chunks.push(remaining.slice(0, breakPoint).trimEnd());
+        remaining = remaining.slice(breakPoint).trimStart();
+      }
+
+      // Send first chunk as reply, rest as follow-up messages
+      await message.reply({
+        content: chunks[0],
+        allowedMentions: { repliedUser: false },
+      });
+
+      for (let i = 1; i < chunks.length; i++) {
+        await channel.send({
+          content: chunks[i],
+        });
+      }
     }
-
-    await message.reply({
-      content: responseText,
-      allowedMentions: { repliedUser: false },
-    });
   } catch (err) {
     logger.error('Thread AI chat error:', err);
     await message.reply({
