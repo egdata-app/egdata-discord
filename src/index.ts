@@ -49,15 +49,13 @@ client.commands = new Collection<string, Command>();
 
 // Load commands
 async function loadCommands() {
-  // In dev mode, we're running from src/, in prod from dist/
-  const ext = IS_DEV ? '.ts' : '.js';
   const commandsFolder = path.join(__dirname, 'commands');
-  logger.info(`Loading commands from ${commandsFolder} (ext: ${ext})`);
+  logger.info(`Loading commands from ${commandsFolder}`);
 
   try {
     const commandFiles = fs
       .readdirSync(commandsFolder)
-      .filter((file) => file.endsWith(ext));
+      .filter((file) => file.endsWith('.ts'));
 
     for (const file of commandFiles) {
       const commandPath = path.join(commandsFolder, file);
@@ -80,13 +78,12 @@ async function loadCommands() {
 
 // Deploy commands to Discord
 async function deployCommands() {
-  const ext = IS_DEV ? '.ts' : '.js';
   const commandsFolder = path.join(__dirname, 'commands');
   const commands: any[] = [];
 
   const commandFiles = fs
     .readdirSync(commandsFolder)
-    .filter((file) => file.endsWith(ext));
+    .filter((file) => file.endsWith('.ts'));
 
   for (const file of commandFiles) {
     const commandPath = path.join(commandsFolder, file);
