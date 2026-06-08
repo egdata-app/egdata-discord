@@ -75,7 +75,9 @@ export class GeolockCommand extends BaseCommand {
           ? [
             {
               name: 'Countries Blacklisted',
-              value: (data.countriesBlacklist ?? []).join(', '),
+              value: [...(data.countriesBlacklist ?? [])]
+                .sort((a, b) => a.localeCompare(b))
+                .join(', '),
             },
           ]
           : []),
