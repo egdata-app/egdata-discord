@@ -128,3 +128,6 @@ dist
 .yarn/build-state.yml
 .yarn/install-state.gz
 .pnp.*
+
+# Durable Discord social suggestion delivery/review journal
+data/social-suggestions.jsonl*
