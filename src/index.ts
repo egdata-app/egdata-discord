@@ -23,6 +23,7 @@ import { logger } from './utils/logger.js';
 import consola from 'consola';
 import { client as apiClient } from './utils/client.js';
 import { threadSessions, sessionThreadTitles, extractThreadTitle, AI_WORKER_URL, pendingAskUserRequests } from './commands/ask.js';
+import { createSocialSuggestions } from './social/index.js';
 
 const IS_DEV = process.env['DEV_MODE'] === 'true';
 
@@ -35,14 +36,18 @@ const client = new Client({
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent,
     GatewayIntentBits.DirectMessages,
+    GatewayIntentBits.DirectMessageReactions,
     GatewayIntentBits.GuildMessageReactions,
   ],
   partials: [
     Partials.Channel, // Required to receive events from uncached channels/threads
     Partials.Message, // Required to receive events from uncached messages
+    Partials.Reaction,
     Partials.ThreadMember, // Required to receive events from threads after restart
   ],
 });
+
+const socialSuggestions = createSocialSuggestions(client, (message, error) => logger.warn(message, error));
 
 // Properly type the commands collection
 client.commands = new Collection<string, Command>();
@@ -214,6 +219,7 @@ async function handleAutocomplete(interaction: AutocompleteInteraction) {
 client.once(Events.ClientReady, async (readyClient) => {
   logger.info(`Logged in as ${readyClient.user.tag}`);
   client.user?.setActivity('EGS changes...', { type: ActivityType.Watching });
+  socialSuggestions?.start();
 
   // Join active threads created by the bot to receive messages after restart
   try {
@@ -740,6 +746,11 @@ async function handleThreadMessage(message: import('discord.js').Message, sessio
 
 client.on(Events.MessageReactionAdd, async (reaction, user) => {
   try {
+    await socialSuggestions?.reaction({
+      userId: user.id, userBot: Boolean(user.bot), isDm: !reaction.message.guildId,
+      messageId: reaction.message.id, channelId: reaction.message.channelId,
+      emoji: reaction.emoji.name || '',
+    });
     // Handle partial reactions
     if (reaction.partial) {
       await reaction.fetch();
@@ -784,12 +795,14 @@ process.on('unhandledRejection', (reason, promise) => {
 // Graceful shutdown
 process.on('SIGTERM', async () => {
   logger.info('Received SIGTERM. Shutting down gracefully...');
+  await socialSuggestions?.stop();
   await client.destroy();
   process.exit(0);
 });
 
 process.on('SIGINT', async () => {
   logger.info('Received SIGINT. Shutting down gracefully...');
+  await socialSuggestions?.stop();
   await client.destroy();
   process.exit(0);
 });

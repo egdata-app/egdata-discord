@@ -10,6 +10,7 @@
     "dev": "DEV_MODE=true bun run src/index.ts",
     "dev:watch": "DEV_MODE=true bun --watch src/index.ts",
     "build": "tsc",
+    "test:social": "tsc && node --test tests/social.test.mjs",
     "start": "bun run src/index.ts",
     "deploy": "bun run src/deploy.ts",
     "deploy:start": "bun run src/deploy.ts && bun run src/index.ts"
