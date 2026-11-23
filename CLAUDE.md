@@ -53,7 +53,7 @@ Commands live in `src/commands/` and extend `BaseCommand` (src/types/BaseCommand
 
 Commands are dynamically loaded at startup and stored in `client.commands` Collection.
 
-Current commands: ping, offer, freebies, assets, regenerate, items, seller, geolocks, ask, clear-chat
+Current commands: ping, offer, freebies, assets, regenerate, items, seller, geolocks, ask, clear-chat, release-stats
 
 **AI Commands:**
 - `ask` - Ask EGData AI questions about games, prices, deals (uses AI worker)

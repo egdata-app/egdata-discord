@@ -960,6 +960,72 @@ export const egdataTools = {
 		execute: async (_args, _options: ToolOptions) => apiRequest("/stats"),
 	}),
 
+	get_release_stats: tool({
+		description:
+			"Get historical base-game release or store creation statistics on the Epic Games Store since launch (Dec 2018). " +
+			"Returns monthly and yearly counts, current month releases so far, current year releases so far, all-time total, " +
+			"peak release year, peak release month, top 10 months, and average monthly releases. " +
+			"Use for questions about how many games released this month/year, which year or month had the most releases, or release trends over time.",
+		inputSchema: z.object({
+			metric: z
+				.enum(["releases", "creations"])
+				.optional()
+				.describe("Whether to count by official releaseDate ('releases', default) or store creationDate ('creations')."),
+		}),
+		execute: async ({ metric }, _options: ToolOptions) => {
+			const mode = metric || "releases";
+			const [monthlyRaw, yearlyRaw] = await Promise.all([
+				fetch(`${API_BASE}/stats/${mode}/monthly`).then((r) => (r.ok ? r.json() : [])),
+				fetch(`${API_BASE}/stats/${mode}/yearly`).then((r) => (r.ok ? r.json() : [])),
+			]);
+
+			const monthlyList = (Array.isArray(monthlyRaw) ? monthlyRaw : []).map(
+				(row: Record<string, unknown>) => ({
+					year: Number(row.year),
+					month: Number(row.month),
+					count: Number(row[mode] ?? row.releases ?? row.creations ?? 0),
+				})
+			);
+
+			const yearlyList = (Array.isArray(yearlyRaw) ? yearlyRaw : []).map(
+				(row: Record<string, unknown>) => ({
+					year: Number(row.year),
+					count: Number(row[mode] ?? row.releases ?? row.creations ?? 0),
+				})
+			);
+
+			const now = new Date();
+			const currentYear = now.getUTCFullYear();
+			const currentMonth = now.getUTCMonth() + 1;
+
+			const thisMonth =
+				monthlyList.find((r) => r.year === currentYear && r.month === currentMonth)?.count ?? 0;
+			const thisYear =
+				yearlyList.find((r) => r.year === currentYear)?.count ??
+				monthlyList
+					.filter((r) => r.year === currentYear)
+					.reduce((sum, r) => sum + r.count, 0);
+
+			const sortedYears = [...yearlyList].sort((a, b) => b.count - a.count);
+			const sortedMonths = [...monthlyList].sort((a, b) => b.count - a.count);
+			const totalAllTime = yearlyList.reduce((sum, r) => sum + r.count, 0);
+
+			return {
+				metric: mode,
+				currentYear,
+				currentMonth,
+				thisMonthSoFar: thisMonth,
+				thisYearSoFar: thisYear,
+				totalAllTime,
+				peakYear: sortedYears[0] || null,
+				peakMonth: sortedMonths[0] || null,
+				top10Months: sortedMonths.slice(0, 10),
+				yearlyBreakdown: yearlyList,
+				monthlyBreakdown: monthlyList,
+			};
+		},
+	}),
+
 	get_offer_achievements: tool({
 		description:
 			"Get achievements/trophies for a game including names, descriptions, XP values, and unlock rarity (completedPercent). " +

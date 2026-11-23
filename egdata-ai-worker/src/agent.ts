@@ -164,6 +164,8 @@ function getToolDescription(toolName: string, args: ToolArgs): string {
 			return "Checking active promotions...";
 		case "get_store_stats":
 			return "Getting store statistics...";
+		case "get_release_stats":
+			return "Analyzing release statistics...";
 
 		// Price tools
 		case "get_offer_price_stats":
