@@ -73,6 +73,8 @@ export class SocialSuggestionsService {
 
   tick(): Promise<void> {
     return this.serialize(async () => {
+      // Ensure the journal lock can be acquired before contacting the backend or Discord.
+      this.journal.entries();
       const page = await this.api.list(this.cursor);
       this.cursor = page.nextCursor;
       for (const suggestion of page.items) {

@@ -11,8 +11,8 @@ RUN pnpm install --frozen-lockfile --prod
 FROM oven/bun:1 AS runtime
 WORKDIR /app
 
-# Install curl for Coolify health checks
-RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+# Install curl and wget for Coolify health checks
+RUN apt-get update && apt-get install -y --no-install-recommends curl wget && rm -rf /var/lib/apt/lists/*
 
 # Copy dependencies from deps stage
 COPY --from=deps /app/node_modules ./node_modules
@@ -22,5 +22,5 @@ COPY . .
 
 EXPOSE 3000
 
-# Deploy commands and start the bot with Bun runtime
-CMD ["bun", "run", "deploy:start"]
+# Deploy commands and start the bot directly with Bun (exec so PID 1 receives SIGTERM)
+CMD ["sh", "-c", "bun run src/deploy.ts && exec bun run src/index.ts"]
